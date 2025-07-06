@@ -59,33 +59,65 @@ class DownloadProgress:
         self.last_speed = ""
         self.last_eta = ""
 
-    async def update(self, data):
-        if self.cancelled:
-            return
-            
-        current_time = time.time()
-        # Actualizar solo si han pasado más de 15 segundos o si hay cambios importantes
-        if current_time - self.last_update > 15 or 'force' in data:
-            elapsed = current_time - self.start_time
-            elapsed_str = self.format_time(elapsed)
-            
-            # Extraer datos
-            percent = data.get('percent', self.last_percent)
-            speed = data.get('speed', self.last_speed)
-            eta = data.get('eta', self.last_eta)
-            
-            # Actualizar últimos valores
-            self.last_percent = percent
-            self.last_speed = speed
-            self.last_eta = eta
-            
-            # Construir texto de progreso
-            progress_text = (
-                f"[{self.task_id}] ⏬ Descargando\n"
-                f"📊 {percent}%\n"
-                f"⚡ {speed}\n"
-                f"⏱️ {elapsed_str} / ETA {eta}"
-            )
+    # En la clase DownloadProgress, modifica el método update:
+async def update(self, data):
+    if self.cancelled:
+        return
+    current_time = time.time()
+    
+    # Extraer datos
+    downloaded = data.get('downloaded', 0)
+    total = data.get('total', 0)
+    unit = data.get('unit', 'MB')
+    speed = data.get('speed', self.last_speed)
+    eta = data.get('eta', self.last_eta)
+    
+    # Formatear texto
+    progress_text = (
+        f"[{self.task_id}] ⏬ Descargando\n"
+        f"📊 {downloaded:.1f} {unit} de {total:.1f} {unit}\n"
+        f"⚡ {speed}\n"
+        f"⏱️ ETA {eta}"
+    )
+    
+    # Actualizar solo cada 15 segundos o cambios importantes
+    if current_time - self.last_update > 15 or 'force' in data:
+        try:
+            await self.message.edit(progress_text)
+            self.last_update = current_time
+        except Exception as e:
+            logger.error(f"Error al actualizar progreso: {str(e)}")
+
+# En la función download_with_ytdlp, modifica el patrón regex y el procesamiento:
+progress_pattern = re.compile(
+    r'\[download\]\s+'
+    r'(\d+\.\d+)%\s+of\s+'
+    r'([\d.]+)([KMGT]?i?B)\s+'
+    r'at\s+'
+    r'([\d.]+)([KMGT]?i?B)/s\s+'
+    r'ETA\s+(\d+:\d+)'
+)
+
+# En el bucle de lectura de la salida:
+match = progress_pattern.search(line)
+if match:
+    percent = float(match.group(1))
+    total_value = float(match.group(2))
+    total_unit = match.group(3)
+    speed_value = match.group(4)
+    speed_unit = match.group(5)
+    eta = match.group(6)
+    
+    # Calcular descargado
+    downloaded = (percent / 100) * total_value
+    
+    await progress_callback({
+        'downloaded': downloaded,
+        'total': total_value,
+        'unit': total_unit,
+        'speed': f"{speed_value} {speed_unit}/s",
+        'eta': eta
+    })
             
             if progress_text != self.progress_text:
                 self.progress_text = progress_text
