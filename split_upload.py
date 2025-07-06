@@ -2,8 +2,8 @@ import os
 import subprocess
 import asyncio
 import logging
-from kunigram import Client
-from kunigram.types import Message
+from pyrogram import Client
+from pyrogram.types import Message
 
 logger = logging.getLogger(__name__)
 
