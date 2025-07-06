@@ -7,10 +7,9 @@ import logging
 import mimetypes
 import uuid
 import json
-import shutil
 from collections import defaultdict
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from pyrogram.types import Message
 from split_upload import split_and_upload
 
 # Configuración
@@ -54,7 +53,6 @@ class DownloadProgress:
         self.start_time = time.time()
         self.task_id = task_id
         self.cancelled = False
-        self.keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{task_id}")]])
 
     async def update(self, text):
         if self.cancelled:
@@ -67,7 +65,7 @@ class DownloadProgress:
             if text != self.progress_text:
                 self.progress_text = text
                 try:
-                    await self.message.edit(f"[{self.task_id}] {text}", reply_markup=self.keyboard)
+                    await self.message.edit(f"[{self.task_id}] {text}")
                 except Exception as e:
                     logger.error(f"Error al actualizar progreso: {str(e)}")
 
@@ -97,51 +95,28 @@ def cancel_task(task_id):
         return True
     return False
 
-async def get_video_formats(url):
-    """Obtiene los formatos de video disponibles usando yt-dlp"""
-    cmd = ["yt-dlp", "-F", url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            logger.error(f"Error al obtener formatos: {result.stderr}")
-            return None
-        
-        # Parsear la salida
-        formats = []
-        for line in result.stdout.split('\n'):
-            if re.match(r'^\d+\s+\w+', line):
-                parts = line.split()
-                format_id = parts[0]
-                resolution = next((p for p in parts if re.match(r'^\d+x\d+', p)), "")
-                if resolution:
-                    formats.append((format_id, resolution))
-        return formats
-    except Exception as e:
-        logger.error(f"Error en get_video_formats: {e}")
-        return None
-
-async def download_content(url, custom_filename=None, progress_callback=None, task_id=None, format_id=None):
-    """Descarga contenido usando yt-dlp con formato específico si se especifica"""
-    download_path = f"/tmp/downloads/{task_id}"
+async def download_content(url, custom_filename=None, progress_callback=None, task_id=None):
+    """Descarga contenido usando yt-dlp para todos los tipos de enlaces"""
+    download_path = "/tmp/downloads"
     os.makedirs(download_path, exist_ok=True)
     
+    # Usar yt-dlp para todos los tipos de enlaces
+    return await download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id)
+
+async def download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id):
+    """Descarga contenido usando yt-dlp con concurrencia mejorada"""
     try:
         cmd = [
             "yt-dlp",
             "-o", f"{download_path}/%(title)s.%(ext)s",
             "--no-playlist",
-            "--concurrent-fragments", "5",
-            "--no-part",
+            "--concurrent-fragments", "5",  # Fragmentos concurrentes
             url
         ]
         
-        if format_id:
-            cmd.extend(["-f", format_id])
-        if custom_filename:
-            cmd.extend(["-o", f"{download_path}/{custom_filename}"])
-
         logger.info(f"Iniciando descarga yt-dlp: {' '.join(cmd)}")
         
+        # Ejecutar yt-dlp capturando salida
         process = subprocess.Popen(
             cmd, 
             stdout=subprocess.PIPE,
@@ -156,7 +131,8 @@ async def download_content(url, custom_filename=None, progress_callback=None, ta
         for line in process.stdout:
             if progress_callback and task_id in active_tasks and not active_tasks[task_id].cancelled:
                 if "ETA" in line and "]" in line:
-                    match = re.search(r'(\d+\.?\d*)%', line)
+                    # Extraer porcentaje de progreso
+                    match = re.search(r'(\d+\.\d+)%', line)
                     if match:
                         percent = match.group(1)
                         await progress_callback(f"⏬ Descargando... {percent}%")
@@ -168,7 +144,17 @@ async def download_content(url, custom_filename=None, progress_callback=None, ta
         
         # Buscar el archivo descargado
         files = os.listdir(download_path)
-        return os.path.join(download_path, files[0]) if files else None
+        if not files:
+            return None
+            
+        original_file = os.path.join(download_path, files[0])
+        
+        # Renombrar si se especifica
+        if custom_filename:
+            new_file = os.path.join(download_path, custom_filename)
+            os.rename(original_file, new_file)
+            return new_file
+        return original_file
         
     except Exception as e:
         logger.error(f"Error en descarga yt-dlp: {e}")
@@ -223,6 +209,7 @@ async def start(client: Client, message: Message):
         "Archivos >1990MB se dividirán automáticamente\n\n"
         "Comandos disponibles:\n"
         "/start - Muestra este mensaje\n"
+        "/cancel [ID] - Cancela una tarea en progreso\n"
         "/update - Actualiza herramientas (solo propietario)"
     )
 
@@ -237,6 +224,7 @@ async def update_bot(client: Client, message: Message):
     log_file = "/tmp/update_error.log"
     
     try:
+        # Actualizar solo yt-dlp
         update_cmd = [
             "pip", "install", "--upgrade", 
             "yt-dlp[default,curl-cffi]"
@@ -251,6 +239,7 @@ async def update_bot(client: Client, message: Message):
         if result.returncode != 0:
             raise Exception(f"Error al actualizar: {result.stdout}")
         
+        # Obtener versión de yt-dlp
         version_cmd = ["yt-dlp", "--version"]
         version_result = subprocess.run(version_cmd, stdout=subprocess.PIPE, text=True)
         ytdlp_version = version_result.stdout.strip()
@@ -264,6 +253,7 @@ async def update_bot(client: Client, message: Message):
         os._exit(0)
         
     except Exception as e:
+        # Guardar log de error
         with open(log_file, "w") as f:
             f.write(str(e))
         
@@ -274,117 +264,29 @@ async def update_bot(client: Client, message: Message):
         )
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
-@app.on_callback_query()
-async def handle_callbacks(client: Client, callback_query: CallbackQuery):
-    """Maneja todos los callbacks de botones"""
-    data = callback_query.data
-    task_id = data.split('_')[-1]
-    
-    if data.startswith("cancel_"):
-        if cancel_task(task_id):
-            await callback_query.answer("✅ Tarea cancelada")
-            await callback_query.message.edit(f"[{task_id}] ❌ Tarea cancelada por el usuario")
-        else:
-            await callback_query.answer("⚠️ Tarea no encontrada o ya completada")
-    
-    elif data.startswith("format_"):
-        format_id = data.split('_')[1]
-        task_data = active_tasks.get(task_id, {})
-        
-        if not task_data:
-            await callback_query.answer("⚠️ Tarea expirada")
-            return
-            
-        await callback_query.answer(f"Seleccionado formato: {format_id}")
-        await callback_query.message.edit(f"[{task_id}] ⏬ Preparando descarga...")
-        
-        # Iniciar descarga con formato seleccionado
-        file_path = await download_content(
-            task_data['url'], 
-            task_data.get('custom_name'),
-            task_data['progress'].update,
-            task_id,
-            format_id
+@app.on_message(filters.command("cancel"))
+async def cancel_command(client: Client, message: Message):
+    """Cancela una tarea por ID"""
+    args = message.text.split()
+    if len(args) < 2:
+        active_list = "\n".join([f"- {task_id}" for task_id in active_tasks.keys()])
+        await message.reply(
+            f"❌ Uso: /cancel <ID>\n\n"
+            f"Tareas activas:\n{active_list if active_list else 'No hay tareas activas'}"
         )
-        
-        await process_download_completion(client, task_id, file_path, callback_query.message)
-
-async def process_download_completion(client, task_id, file_path, progress_message):
-    """Procesa el resultado de la descarga y maneja la subida"""
-    # Verificar si la tarea fue cancelada durante la descarga
-    if task_id not in active_tasks or active_tasks[task_id]['progress'].cancelled:
-        if file_path and os.path.exists(file_path):
-            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
         return
     
-    if not file_path or not os.path.exists(file_path):
-        await progress_message.edit(f"[{task_id}] ❌ Error al descargar el contenido")
-        if task_id in active_tasks:
-            del active_tasks[task_id]
-        return
-    
-    file_size = os.path.getsize(file_path)
-    size_mb = file_size / (1024 * 1024)
-    
-    # Determinar si se necesita dividir
-    if file_size > MAX_DIRECT_SIZE:
-        await progress_message.edit(f"[{task_id}] 📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
-        await split_and_upload(
-            client, 
-            active_tasks[task_id]['original_message'], 
-            progress_message, 
-            file_path, 
-            task_id
-        )
+    task_id = args[1].strip()
+    if cancel_task(task_id):
+        await message.reply(f"✅ Tarea {task_id} cancelada correctamente")
     else:
-        await progress_message.edit(f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
-        try:
-            # Detectar tipo MIME
-            mime_type, _ = mimetypes.guess_type(file_path)
-            is_video = mime_type and mime_type.startswith('video/')
-            
-            if is_video:
-                metadata = get_video_metadata(file_path)
-                caption = f"📹 {os.path.basename(file_path)}"
-                if metadata:
-                    size_mb = metadata['size'] / (1024 * 1024)
-                    caption = (
-                        f"📹 {os.path.basename(file_path)}\n"
-                        f"💾 {size_mb:.2f} MB\n"
-                        f"🖥️ {metadata['resolution']}\n"
-                        f"⏱️ {metadata['duration']:.2f} seg"
-                    )
-                
-                await client.send_video(
-                    chat_id=active_tasks[task_id]['original_message'].chat.id,
-                    video=file_path,
-                    caption=caption,
-                    progress=upload_progress_callback,
-                    progress_args=(progress_message, task_id)
-                )
-            else:
-                await client.send_document(
-                    chat_id=active_tasks[task_id]['original_message'].chat.id,
-                    document=file_path,
-                    progress=upload_progress_callback,
-                    progress_args=(progress_message, task_id)
-                )
-            await progress_message.edit(f"[{task_id}] ✅ Subida completada")
-        except Exception as e:
-            await progress_message.edit(f"[{task_id}] ❌ Error en subida: {str(e)}")
-    
-    # Limpieza
-    if file_path and os.path.exists(file_path):
-        shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
-    
-    # Eliminar tarea de seguimiento
-    if task_id in active_tasks:
-        del active_tasks[task_id]
+        await message.reply("⚠️ ID de tarea no encontrada o ya completada")
 
 # Filtro para manejar enlaces
 @app.on_message(filters.text | filters.command)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
+    # Verificar si el mensaje contiene un comando
     if message.text.startswith('/'):
         return
     
@@ -398,51 +300,11 @@ async def handle_links(client: Client, message: Message):
     
     # Generar ID único para la tarea
     task_id = str(uuid.uuid4())[:8].upper()
+    task_counters[message.chat.id] += 1
     
-    # Verificar si es un video con múltiples resoluciones
-    is_video_source = any(domain in url for domain in ["youtube.com", "youtu.be", "vimeo.com"])
-    if is_video_source:
-        formats = await get_video_formats(url)
-        if formats:
-            buttons = []
-            for format_id, resolution in formats:
-                buttons.append([InlineKeyboardButton(
-                    f"📹 {resolution}", 
-                    callback_data=f"format_{format_id}_{task_id}"
-                )])
-            
-            buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{task_id}")])
-            keyboard = InlineKeyboardMarkup(buttons)
-            
-            msg = await message.reply(
-                f"[{task_id}] Seleccione la resolución deseada:",
-                reply_markup=keyboard
-            )
-            
-            # Almacenar información de la tarea
-            active_tasks[task_id] = {
-                'url': url,
-                'custom_name': custom_name,
-                'progress': DownloadProgress(msg, task_id),
-                'original_message': message
-            }
-            return
-    
-    # Si no hay formatos disponibles o no es video
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{task_id}")]])
-    msg = await message.reply(
-        f"[{task_id}] ⏬ Iniciando descarga...",
-        reply_markup=keyboard
-    )
-    
-    # Almacenar información de la tarea
+    msg = await message.reply(f"[{task_id}] ⏬ Iniciando descarga...")
     progress = DownloadProgress(msg, task_id)
-    active_tasks[task_id] = {
-        'url': url,
-        'custom_name': custom_name,
-        'progress': progress,
-        'original_message': message
-    }
+    active_tasks[task_id] = progress
     
     # Descargar contenido
     file_path = await download_content(
@@ -452,10 +314,74 @@ async def handle_links(client: Client, message: Message):
         task_id
     )
     
-    await process_download_completion(client, task_id, file_path, msg)
+    # Verificar si la tarea fue cancelada durante la descarga
+    if task_id not in active_tasks or active_tasks[task_id].cancelled:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        return
+    
+    if not file_path or not os.path.exists(file_path):
+        await msg.edit(f"[{task_id}] ❌ Error al descargar el contenido")
+        if task_id in active_tasks:
+            del active_tasks[task_id]
+        return
+    
+    file_size = os.path.getsize(file_path)
+    size_mb = file_size / (1024 * 1024)
+    
+    # Determinar si se necesita dividir
+    if file_size > MAX_DIRECT_SIZE:
+        await msg.edit(f"[{task_id}] 📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
+        await split_and_upload(client, message, msg, file_path, task_id)
+    else:
+        await msg.edit(f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
+        try:
+            # Detectar tipo MIME para enviar como video si es posible
+            mime_type, _ = mimetypes.guess_type(file_path)
+            is_video = mime_type and mime_type.startswith('video/')
+            
+            if is_video:
+                # Obtener metadatos del video
+                metadata = get_video_metadata(file_path)
+                caption = f"📹 {os.path.basename(file_path)}"
+                if metadata:
+                    size_mb = metadata['size'] / (1024 * 1024)
+                    caption = (
+                        f"📹 {os.path.basename(file_path)}\n"
+                        f"💾 {size_mb:.2f} MB\n"
+                        f"🖥️ {metadata['resolution']}\n"
+                        f"⏱️ {metadata['duration']:.2f} seg"
+                    )
+                
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=file_path,
+                    caption=caption,
+                    progress=upload_progress_callback,
+                    progress_args=(msg, task_id)
+                )
+            else:
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    progress=upload_progress_callback,
+                    progress_args=(msg, task_id)
+                )
+            await msg.edit(f"[{task_id}] ✅ Subida completada")
+        except Exception as e:
+            await msg.edit(f"[{task_id}] ❌ Error en subida: {str(e)}")
+    
+    # Limpieza
+    if file_path and os.path.exists(file_path):
+        os.remove(file_path)
+    
+    # Eliminar tarea de seguimiento
+    if task_id in active_tasks:
+        del active_tasks[task_id]
 
 async def upload_progress_callback(current, total, msg, task_id):
     """Muestra progreso de subida cada 20 segundos"""
+    current_time = time.time()
     if not hasattr(upload_progress_callback, 'last_update'):
         upload_progress_callback.last_update = {}
     
@@ -463,18 +389,17 @@ async def upload_progress_callback(current, total, msg, task_id):
         upload_progress_callback.last_update[task_id] = 0
     
     # Verificar si la tarea fue cancelada
-    if task_id in active_tasks and active_tasks[task_id]['progress'].cancelled:
+    if task_id in active_tasks and active_tasks[task_id].cancelled:
         return
     
-    current_time = time.time()
+    # Actualizar solo si han pasado más de 20 segundos
     if current_time - upload_progress_callback.last_update[task_id] > 20:
         upload_progress_callback.last_update[task_id] = current_time
         percent = current * 100 / total
         try:
-            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{task_id}")]])
-            await msg.edit(f"[{task_id}] ⬆️ Subiendo... {percent:.1f}%", reply_markup=keyboard)
+            await msg.edit(f"[{task_id}] ⬆️ Subiendo... {percent:.1f}%")
         except Exception:
-            pass
+            pass  # Ignorar errores de actualización
 
 if __name__ == "__main__":
     logger.info("⚡ Bot iniciado con Pyrofork ⚡")
