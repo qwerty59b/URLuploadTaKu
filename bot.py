@@ -306,7 +306,7 @@ async def update_bot(client: Client, message: Message):
         update_cmd = [
             "pip", "install", "--upgrade", 
             "yt-dlp[default,curl-cffi]", 
-            "aria2c"
+            "aria2p"
         ]
         result = subprocess.run(
             update_cmd,
