@@ -43,8 +43,57 @@ app = Client(
 active_tasks = {}
 task_counters = defaultdict(int)
 current_downloads = {}
-user_active_tasks = {}
 pending_choices = {}
+
+# ============================== NUEVO: Sistema de colas ==============================
+class DownloadQueue:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.active_tasks = {}
+        self.queue_status = {}
+        self.processing = False
+
+    async def add_task(self, task_data):
+        task_id = task_data['task_id']
+        self.queue_status[task_id] = "En cola"
+        await self.queue.put(task_data)
+        return self.queue.qsize()
+
+    async def process_queue(self):
+        if self.processing:
+            return
+            
+        self.processing = True
+        while not self.queue.empty():
+            task_data = await self.queue.get()
+            task_id = task_data['task_id']
+            
+            try:
+                self.queue_status[task_id] = "Procesando"
+                await handle_download_task(task_data)
+                self.queue_status[task_id] = "Completado"
+            except Exception as e:
+                self.queue_status[task_id] = f"Error: {str(e)}"
+                logger.error(f"Error en tarea {task_id}: {e}")
+            finally:
+                self.queue.task_done()
+                if task_id in self.queue_status:
+                    del self.queue_status[task_id]
+                # Pequeña pausa entre tareas
+                await asyncio.sleep(2)
+        
+        self.processing = False
+
+    def get_queue_size(self):
+        return self.queue.qsize()
+
+    def get_queue_status(self):
+        return self.queue_status
+
+# Cola global para gestionar todas las tareas
+download_queue = DownloadQueue()
+
+# ===================== FIN del nuevo sistema de colas =====================
 
 def is_owner(user_id):
     return user_id == OWNER_ID
@@ -371,8 +420,9 @@ async def start(client: Client, message: Message):
         "`https://ejemplo.com/video.mp4 | Mi Video Personalizado.mp4`\n\n"
         "Comandos disponibles:\n"
         "/start - Muestra este mensaje\n"
-        "/update - Actualiza herramientas (solo propietario)\n\n"
-        "⚠️ Solo puedes tener 1 tarea activa a la vez"
+        "/update - Actualiza herramientas (solo propietario)\n"
+        "/queue - Muestra el estado de la cola de descargas\n\n"
+        "⚠️ Ahora puedes tener múltiples tareas en cola"
     )
 
 @app.on_message(filters.command("update") & filters.private)
@@ -430,22 +480,38 @@ async def update_bot(client: Client, message: Message):
         )
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
+# ================== NUEVO: Comando para ver la cola ==================
+@app.on_message(filters.command("queue"))
+async def show_queue(client: Client, message: Message):
+    """Muestra el estado actual de la cola de descargas"""
+    queue_status = download_queue.get_queue_status()
+    queue_size = download_queue.get_queue_size()
+    
+    if not queue_status and queue_size == 0:
+        await message.reply("✅ La cola de descargas está vacía")
+        return
+        
+    response = "📋 **Estado de la cola de descargas**\n\n"
+    
+    # Mostrar tareas en cola
+    if queue_size > 0:
+        response += f"🔄 **Tareas pendientes:** {queue_size}\n"
+    
+    # Mostrar tareas activas
+    if queue_status:
+        response += "\n**Tareas en progreso:**\n"
+        for task_id, status in queue_status.items():
+            response += f"• `{task_id}`: {status}\n"
+    
+    await message.reply(response)
+
+# ================== FIN del nuevo comando ==================
+
 @app.on_message(filters.text | filters.command)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
     if message.text.startswith('/'):
         return
-    
-    user_id = message.from_user.id
-    if user_id in user_active_tasks:
-        task_id_actual = user_active_tasks[user_id]
-        if task_id_actual in active_tasks:
-            await message.reply(
-                "⚠️ Ya tienes una tarea en curso.\n"
-                f"ID de tarea actual: `{task_id_actual}`\n\n"
-                "Por favor espera a que finalice."
-            )
-            return
     
     user_input = message.text
     parts = user_input.split(" | ", 1)
@@ -502,28 +568,50 @@ async def handle_download_choice(client, callback_query):
     url = choice_info["url"]
     custom_name = choice_info["custom_name"]
     
-    # Verificar si el usuario tiene tarea activa
-    if user_id in user_active_tasks:
-        task_id_actual = user_active_tasks[user_id]
-        if task_id_actual in active_tasks:
-            await callback_query.answer(
-                "Ya tienes una tarea activa. Espera a que termine.",
-                show_alert=True
-            )
-            return
-    
     # Generar ID único para la tarea
     task_id = str(uuid.uuid4())[:8].upper()
     task_counters[callback_query.message.chat.id] += 1
     
-    # Registrar tarea
-    user_active_tasks[user_id] = task_id
-    
     # Eliminar mensaje de selección
     await callback_query.message.delete()
     
+    # Preparar datos de la tarea
+    task_data = {
+        'task_id': task_id,
+        'url': url,
+        'custom_name': custom_name,
+        'method': method,
+        'chat_id': callback_query.message.chat.id,
+        'user_id': user_id
+    }
+    
+    # ============== NUEVO: Agregar a la cola en lugar de ejecutar ==============
+    queue_position = await download_queue.add_task(task_data)
+    
+    # Iniciar procesamiento de la cola
+    asyncio.create_task(download_queue.process_queue())
+    
+    # Enviar confirmación de encolado
+    await callback_query.message.reply(
+        f"✅ **Tarea añadida a la cola**\n\n"
+        f"**ID de tarea:** `{task_id}`\n"
+        f"**Método:** `{method}`\n"
+        f"**Posición en cola:** `{queue_position}`\n\n"
+        "Usa /queue para ver el estado de la cola"
+    )
+    # ================== FIN de la modificación ==================
+
+# ============== NUEVA FUNCIÓN: Manejo de tareas desde la cola ==============
+async def handle_download_task(task_data):
+    """Procesa una tarea de descarga desde la cola"""
+    task_id = task_data['task_id']
+    url = task_data['url']
+    custom_name = task_data['custom_name']
+    method = task_data['method']
+    chat_id = task_data['chat_id']
+    
     # Iniciar mensaje de progreso
-    msg = await callback_query.message.reply(f"[{task_id}] ⏬ Iniciando descarga con {method}...")
+    msg = await app.send_message(chat_id, f"[{task_id}] ⏬ Iniciando descarga con {method}...")
     progress = DownloadProgress(msg, task_id)
     active_tasks[task_id] = progress
     
@@ -540,8 +628,6 @@ async def handle_download_choice(client, callback_query):
         await msg.edit(f"[{task_id}] ❌ Error al descargar el contenido")
         if task_id in active_tasks:
             del active_tasks[task_id]
-        if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
-            del user_active_tasks[user_id]
         return
     
     file_size = os.path.getsize(file_path)
@@ -550,7 +636,7 @@ async def handle_download_choice(client, callback_query):
     # Determinar si se necesita dividir
     if file_size > MAX_DIRECT_SIZE:
         await msg.edit(f"[{task_id}] 📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
-        await split_and_upload(client, callback_query.message, msg, file_path, task_id)
+        await split_and_upload(client, msg, file_path, task_id)
     else:
         await msg.edit(f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
         try:
@@ -579,8 +665,8 @@ async def handle_download_choice(client, callback_query):
                 else:
                     caption = f"📹 {os.path.basename(file_path)}"
                 
-                await client.send_video(
-                    chat_id=callback_query.message.chat.id,
+                await app.send_video(
+                    chat_id=chat_id,
                     video=file_path,
                     caption=caption,
                     duration=duration,
@@ -593,8 +679,8 @@ async def handle_download_choice(client, callback_query):
                 if thumb and os.path.exists(thumb):
                     os.remove(thumb)
             else:
-                await client.send_document(
-                    chat_id=callback_query.message.chat.id,
+                await app.send_document(
+                    chat_id=chat_id,
                     document=file_path,
                     progress=upload_progress_callback,
                     progress_args=(msg, task_id)
@@ -610,10 +696,7 @@ async def handle_download_choice(client, callback_query):
     # Eliminar tarea de seguimiento
     if task_id in active_tasks:
         del active_tasks[task_id]
-    
-    # Liberar usuario al finalizar la tarea
-    if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
-        del user_active_tasks[user_id]
+# ================== FIN de la nueva función ==================
 
 async def upload_progress_callback(current, total, msg, task_id):
     """Muestra progreso de subida cada 15 segundos"""
