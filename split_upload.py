@@ -3,23 +3,13 @@ import asyncio
 import logging
 import subprocess
 from pyrogram import Client
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
-
-# Acceso a active_tasks desde bot.py (necesario para cancelaciones)
-try:
-    from bot import active_tasks
-except ImportError:
-    active_tasks = {}
 
 async def split_and_upload(client: Client, message: Message, progress_msg: Message, file_path: str, task_id: str):
     """Divide archivos grandes usando 7z (sin compresión) y sube a Telegram"""
     try:
-        # Verificar si la tarea fue cancelada
-        if task_id in active_tasks and active_tasks[task_id].cancelled:
-            return
-        
         # Crear directorio temporal
         split_dir = "/tmp/split_files"
         os.makedirs(split_dir, exist_ok=True)
@@ -35,7 +25,8 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         archive_path = os.path.join(split_dir, f"{base_name}.7z")
         
         # Crear archivo 7z sin compresión (modo almacenamiento)
-        await progress_msg.edit(f"[{task_id}] 🔪 Dividiendo archivo con 7z (sin compresión)...")
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{task_id}")]])
+        await progress_msg.edit(f"[{task_id}] 🔪 Dividiendo archivo con 7z (sin compresión)...", reply_markup=keyboard)
         
         # Usar binario 7z directamente
         cmd = [
@@ -67,16 +58,14 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
             await progress_msg.edit(f"[{task_id}] ❌ No se generaron partes")
             return
         
-        await progress_msg.edit(f"[{task_id}] 📦 Dividido en {len(parts)} partes. Subiendo...")
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{task_id}")]])
+        await progress_msg.edit(f"[{task_id}] 📦 Dividido en {len(parts)} partes. Subiendo...", reply_markup=keyboard)
         
         # Subir cada parte
         for i, part in enumerate(parts):
-            # Verificar si la tarea fue cancelada
-            if task_id in active_tasks and active_tasks[task_id].cancelled:
-                break
-                
             part_path = os.path.join(split_dir, part)
-            await progress_msg.edit(f"[{task_id}] ⬆️ Subiendo parte {i+1}/{len(parts)} ({part})...")
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{task_id}")]])
+            await progress_msg.edit(f"[{task_id}] ⬆️ Subiendo parte {i+1}/{len(parts)} ({part})...", reply_markup=keyboard)
             
             await client.send_document(
                 chat_id=message.chat.id,
@@ -86,9 +75,11 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
             
             os.remove(part_path)
         
-        if task_id in active_tasks and not active_tasks[task_id].cancelled:
-            await progress_msg.edit(f"[{task_id}] ✅ Todos los fragmentos subidos correctamente")
+        await progress_msg.edit(f"[{task_id}] ✅ Todos los fragmentos subidos correctamente")
     
+    except asyncio.CancelledError:
+        logger.info(f"Tarea {task_id} cancelada durante división/subida")
+        await progress_msg.edit(f"[{task_id}] ❌ Operación cancelada")
     except Exception as e:
         logger.error(f"Error en split_and_upload: {str(e)}", exc_info=True)
         await progress_msg.edit(f"[{task_id}] ❌ Error: {str(e)}")
