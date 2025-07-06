@@ -455,16 +455,20 @@ async def handle_links(client: Client, message: Message):
     if not url.startswith(("http://", "https://")):
         return
     
-    # Verificar si es un enlace directo
-    parsed_url = urllib.parse.urlparse(url)
-    is_direct = any(parsed_url.path.endswith(ext) for ext in ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.mp3', '.zip', '.rar'))
+    # Generar ID único para esta elección
+    choice_id = str(uuid.uuid4())[:8]
+    pending_choices[choice_id] = {
+        "url": url,
+        "custom_name": custom_name,
+        "timestamp": time.time()
+    }
     
     # Crear teclado con opciones
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Aria2c (16 conexiones)", callback_data=f"aria2:{custom_name or ''}:{url}"),
-                InlineKeyboardButton("yt-dlp", callback_data=f"ytdlp:{custom_name or ''}:{url}")
+                InlineKeyboardButton("Aria2c (16 conexiones)", callback_data=f"aria2:{choice_id}"),
+                InlineKeyboardButton("yt-dlp", callback_data=f"ytdlp:{choice_id}")
             ]
         ]
     )
@@ -481,10 +485,22 @@ async def handle_download_choice(client, callback_query):
     data = callback_query.data
     
     # Parsear datos del callback
-    parts = data.split(':', 2)
+    parts = data.split(':', 1)
     method = parts[0]
-    custom_name = parts[1] if parts[1] else None
-    url = parts[2]
+    choice_id = parts[1]
+    
+    # Recuperar información de la elección
+    choice_info = pending_choices.get(choice_id)
+    if not choice_info:
+        await callback_query.answer("❌ La opción ha expirado. Por favor inicia una nueva descarga.", show_alert=True)
+        await callback_query.message.delete()
+        return
+    
+    # Eliminar elección pendiente
+    del pending_choices[choice_id]
+    
+    url = choice_info["url"]
+    custom_name = choice_info["custom_name"]
     
     # Verificar si el usuario tiene tarea activa
     if user_id in user_active_tasks:
@@ -621,6 +637,22 @@ async def upload_progress_callback(current, total, msg, task_id):
         except Exception:
             pass  # Ignorar errores de actualización
 
+# Limpiar elecciones pendientes periódicamente
+async def clean_pending_choices():
+    while True:
+        await asyncio.sleep(3600)  # Cada hora
+        current_time = time.time()
+        expired = []
+        for choice_id, choice_info in pending_choices.items():
+            if current_time - choice_info["timestamp"] > 3600:  # 1 hora de expiración
+                expired.append(choice_id)
+        
+        for choice_id in expired:
+            del pending_choices[choice_id]
+
 if __name__ == "__main__":
     logger.info("⚡ Bot iniciado con Pyrofork ⚡")
+    # Iniciar tarea de limpieza en segundo plano
+    app.start()
+    app.loop.create_task(clean_pending_choices())
     app.run()
