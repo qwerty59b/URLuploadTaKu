@@ -10,6 +10,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
+    wget \
     p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
