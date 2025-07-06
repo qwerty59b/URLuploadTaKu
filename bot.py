@@ -6,7 +6,7 @@ import re
 import logging
 import mimetypes
 import uuid
-import signal
+import json
 from collections import defaultdict
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -14,8 +14,8 @@ from split_upload import split_and_upload
 
 # Configuración
 API_ID = int(os.environ.get('API_ID', 0))
-API_HASH = os.environ.get('API_HASH', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+API_HASH = os.environ.get('API_HASH', ''))
+BOT_TOKEN = os.environ.get('BOT_TOKEN', ''))
 OWNER_ID = int(os.environ.get('OWNER_ID', 0))
 MAX_DIRECT_SIZE = 1990 * 1024 * 1024  # 1990 MB
 CONCURRENT_CONNECTIONS = 16  # Conexiones concurrentes para descargas
@@ -241,6 +241,39 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         if task_id in current_downloads:
             del current_downloads[task_id]
 
+def get_video_metadata(file_path):
+    """Obtiene metadatos del video usando ffprobe"""
+    cmd = [
+        'ffprobe',
+        '-v', 'quiet',
+        '-print_format', 'json',
+        '-show_format',
+        '-show_streams',
+        file_path
+    ]
+    
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        metadata = json.loads(result.stdout)
+        
+        # Buscar el stream de video
+        video_stream = next((stream for stream in metadata['streams'] if stream['codec_type'] == 'video'), None)
+        
+        if video_stream:
+            width = int(video_stream.get('width', 0))
+            height = int(video_stream.get('height', 0))
+            duration = float(metadata['format'].get('duration', 0))
+            size = int(metadata['format'].get('size', 0))
+            return {
+                'resolution': f"{width}x{height}",
+                'duration': duration,
+                'size': size
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error al obtener metadatos: {str(e)}")
+        return None
+
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     await message.reply(
@@ -367,7 +400,7 @@ async def handle_links(client: Client, message: Message):
     
     # Verificar si la tarea fue cancelada durante la descarga
     if task_id not in active_tasks or active_tasks[task_id].cancelled:
-        if os.path.exists(file_path):
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
         return
     
@@ -392,9 +425,22 @@ async def handle_links(client: Client, message: Message):
             is_video = mime_type and mime_type.startswith('video/')
             
             if is_video:
+                # Obtener metadatos del video
+                metadata = get_video_metadata(file_path)
+                caption = f"📹 {os.path.basename(file_path)}"
+                if metadata:
+                    size_mb = metadata['size'] / (1024 * 1024)
+                    caption = (
+                        f"📹 {os.path.basename(file_path)}\n"
+                        f"💾 {size_mb:.2f} MB\n"
+                        f"🖥️ {metadata['resolution']}\n"
+                        f"⏱️ {metadata['duration']:.2f} seg"
+                    )
+                
                 await client.send_video(
                     chat_id=message.chat.id,
                     video=file_path,
+                    caption=caption,
                     progress=upload_progress_callback,
                     progress_args=(msg, task_id)
                 )
@@ -410,7 +456,7 @@ async def handle_links(client: Client, message: Message):
             await msg.edit(f"[{task_id}] ❌ Error en subida: {str(e)}")
     
     # Limpieza
-    if os.path.exists(file_path):
+    if file_path and os.path.exists(file_path):
         os.remove(file_path)
     
     # Eliminar tarea de seguimiento
