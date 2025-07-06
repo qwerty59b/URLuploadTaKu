@@ -103,9 +103,9 @@ class DownloadProgress:
         return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
 
 def cancel_task(task_id):
-    """Cancela una tarea por su ID"""
+    """Cancela una tarea por su ID (función interna)"""
     if task_id in current_downloads:
-        logger.info(f"Cancelling task {task_id}")
+        logger.info(f"Cancelando tarea {task_id}...")
         # Matar el proceso asociado
         process = current_downloads[task_id]
         try:
@@ -361,16 +361,10 @@ def parse_formats(output):
 async def start(client: Client, message: Message):
     await message.reply(
         "🤖 **Bot de Descargas Avanzado**\n\n"
-        "Envía un enlace para subir el archivo a Telegram\n\n"
-        "Soporte para:\n"
-        "- Videos (MP4, MKV, AVI, etc.)\n"
-        "- Streams (M3U8, YouTube, etc.)\n"
-        "- Archivos directos (ZIP, PDF, imágenes, etc.)\n\n"
-        "Para renombrar: `http://ejemplo.com/archivo.mp4 | mi_archivo.mp4`\n\n"
-        "Archivos >1990MB se dividirán automáticamente\n\n"
+        # ... (texto existente)
         "Comandos disponibles:\n"
         "/start - Muestra este mensaje\n"
-        "/cancel [ID] - Cancela una tarea en progreso\n"
+        "/cancel - Cancela tu tarea en progreso\n"  # Actualizado
         "/update - Actualiza herramientas (solo propietario)\n\n"
         "⚠️ Solo puedes tener 1 tarea activa a la vez"
     )
@@ -428,15 +422,19 @@ async def update_bot(client: Client, message: Message):
 
 @app.on_message(filters.command("cancel"))
 async def cancel_command(client: Client, message: Message):
-    """Cancela una tarea por ID"""
-    args = message.text.split()
-    if len(args) < 2:
-        active_list = "\n".join([f"- {task_id}" for task_id in active_tasks.keys()])
-        await message.reply(
-            f"❌ Uso: /cancel <ID>\n\n"
-            f"Tareas activas:\n{active_list if active_list else 'No hay tareas activas'}"
-        )
-        return
+    """Cancela la tarea activa del usuario actual"""
+    user_id = message.from_user.id
+    
+    # Verificar si el usuario tiene una tarea activa
+    if user_id in user_active_tasks:
+        task_id = user_active_tasks[user_id]
+        if cancel_task(task_id):
+            await message.reply(f"✅ Tu tarea activa (ID: `{task_id}`) ha sido cancelada.")
+        else:
+            await message.reply("⚠️ No se pudo cancelar la tarea. Puede que ya haya finalizado.")
+    else:
+        await message.reply("ℹ️ No tienes ninguna tarea activa para cancelar.")
+
     
     task_id = args[1].strip()
     if cancel_task(task_id):
@@ -508,7 +506,7 @@ async def handle_links(client: Client, message: Message):
                 "⚠️ Ya tienes una tarea en curso.\n"
                 f"ID de tarea actual: `{task_id_actual}`\n\n"
                 "Espera a que finalice o cancélala con:\n"
-                f"`/cancel {task_id_actual}`"
+                "`/cancel`"  # Cambiado a comando simple
             )
             return
     
