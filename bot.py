@@ -5,8 +5,8 @@ import time
 import re
 import logging
 import mimetypes
-from kunigram import Client, filters
-from kunigram.types import Message
+from pyrogram import Client, filters
+from pyrogram.types import Message
 from split_upload import split_and_upload
 
 # Configuración
