@@ -10,6 +10,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
     aria2 \
+    p7zip-full \  # Mantenemos para soporte adicional
     && rm -rf /var/lib/apt/lists/*
 
 # Directorio de trabajo
