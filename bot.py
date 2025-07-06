@@ -41,6 +41,8 @@ app = Client(
 active_tasks = {}
 task_counters = defaultdict(int)
 current_downloads = {}
+# Nuevo: Control de tareas por usuario
+user_active_tasks = {}
 
 def is_owner(user_id):
     return user_id == OWNER_ID
@@ -59,8 +61,8 @@ class DownloadProgress:
             return
             
         current_time = time.time()
-        # Actualizar solo si han pasado más de 20 segundos
-        if current_time - self.last_update > 20:
+        # MODIFICADO: Actualizar cada 15 segundos (antes 20)
+        if current_time - self.last_update > 15:
             self.last_update = current_time
             if text != self.progress_text:
                 self.progress_text = text
@@ -91,6 +93,12 @@ def cancel_task(task_id):
             del current_downloads[task_id]
         if task_id in active_tasks:
             del active_tasks[task_id]
+        
+        # NUEVO: Eliminar de tareas de usuario
+        for user_id, t_id in list(user_active_tasks.items()):
+            if t_id == task_id:
+                del user_active_tasks[user_id]
+                break
         
         return True
     return False
@@ -130,12 +138,16 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         # Procesar salida para obtener progreso
         for line in process.stdout:
             if progress_callback and task_id in active_tasks and not active_tasks[task_id].cancelled:
+                # MODIFICADO: Actualizar progreso con más frecuencia
                 if "ETA" in line and "]" in line:
                     # Extraer porcentaje de progreso
                     match = re.search(r'(\d+\.\d+)%', line)
                     if match:
                         percent = match.group(1)
                         await progress_callback(f"⏬ Descargando... {percent}%")
+                # Nuevo: Actualizar cada 15 segundos independientemente del progreso
+                elif time.time() - active_tasks[task_id].last_update > 15:
+                    await progress_callback(f"⏬ Descargando... (leyendo datos)")
         
         process.wait()
         if process.returncode != 0:
@@ -210,7 +222,8 @@ async def start(client: Client, message: Message):
         "Comandos disponibles:\n"
         "/start - Muestra este mensaje\n"
         "/cancel [ID] - Cancela una tarea en progreso\n"
-        "/update - Actualiza herramientas (solo propietario)"
+        "/update - Actualiza herramientas (solo propietario)\n\n"
+        "⚠️ **NUEVO:** Solo puedes tener 1 tarea activa a la vez"
     )
 
 @app.on_message(filters.command("update") & filters.private)
@@ -290,6 +303,19 @@ async def handle_links(client: Client, message: Message):
     if message.text.startswith('/'):
         return
     
+    # NUEVO: Verificar si el usuario ya tiene una tarea activa
+    user_id = message.from_user.id
+    if user_id in user_active_tasks:
+        task_id_actual = user_active_tasks[user_id]
+        if task_id_actual in active_tasks:
+            await message.reply(
+                "⚠️ Ya tienes una tarea en curso.\n"
+                f"ID de tarea actual: `{task_id_actual}`\n\n"
+                "Espera a que finalice o cancélala con:\n"
+                f"`/cancel {task_id_actual}`"
+            )
+            return
+    
     user_input = message.text
     parts = user_input.split(" | ", 1)
     url = parts[0].strip()
@@ -301,6 +327,9 @@ async def handle_links(client: Client, message: Message):
     # Generar ID único para la tarea
     task_id = str(uuid.uuid4())[:8].upper()
     task_counters[message.chat.id] += 1
+    
+    # NUEVO: Registrar tarea para el usuario
+    user_active_tasks[user_id] = task_id
     
     msg = await message.reply(f"[{task_id}] ⏬ Iniciando descarga...")
     progress = DownloadProgress(msg, task_id)
@@ -318,12 +347,18 @@ async def handle_links(client: Client, message: Message):
     if task_id not in active_tasks or active_tasks[task_id].cancelled:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
+        # NUEVO: Limpiar registro de usuario si fue cancelada
+        if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
+            del user_active_tasks[user_id]
         return
     
     if not file_path or not os.path.exists(file_path):
         await msg.edit(f"[{task_id}] ❌ Error al descargar el contenido")
         if task_id in active_tasks:
             del active_tasks[task_id]
+        # NUEVO: Limpiar registro de usuario
+        if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
+            del user_active_tasks[user_id]
         return
     
     file_size = os.path.getsize(file_path)
@@ -378,9 +413,13 @@ async def handle_links(client: Client, message: Message):
     # Eliminar tarea de seguimiento
     if task_id in active_tasks:
         del active_tasks[task_id]
+    
+    # NUEVO: Liberar usuario al finalizar la tarea
+    if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
+        del user_active_tasks[user_id]
 
 async def upload_progress_callback(current, total, msg, task_id):
-    """Muestra progreso de subida cada 20 segundos"""
+    """Muestra progreso de subida cada 15 segundos"""
     current_time = time.time()
     if not hasattr(upload_progress_callback, 'last_update'):
         upload_progress_callback.last_update = {}
@@ -392,8 +431,8 @@ async def upload_progress_callback(current, total, msg, task_id):
     if task_id in active_tasks and active_tasks[task_id].cancelled:
         return
     
-    # Actualizar solo si han pasado más de 20 segundos
-    if current_time - upload_progress_callback.last_update[task_id] > 20:
+    # MODIFICADO: Actualizar cada 15 segundos (antes 20)
+    if current_time - upload_progress_callback.last_update[task_id] > 15:
         upload_progress_callback.last_update[task_id] = current_time
         percent = current * 100 / total
         try:
