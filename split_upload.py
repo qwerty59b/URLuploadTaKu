@@ -8,12 +8,6 @@ from pyrogram.types import Message
 
 logger = logging.getLogger(__name__)
 
-# Acceso a active_tasks desde bot.py (necesario para cancelaciones)
-try:
-    from bot import active_tasks
-except ImportError:
-    active_tasks = {}
-
 async def split_upload_progress(current, total, progress_msg, task_id, part_index, total_parts):
     """Callback para mostrar progreso de subida de partes divididas"""
     current_time = time.time()
@@ -48,10 +42,6 @@ async def split_upload_progress(current, total, progress_msg, task_id, part_inde
 async def split_and_upload(client: Client, message: Message, progress_msg: Message, file_path: str, task_id: str):
     """Divide archivos grandes usando 7z (sin compresión) y sube a Telegram"""
     try:
-        # Verificar si la tarea fue cancelada
-        if task_id in active_tasks and active_tasks[task_id].cancelled:
-            return
-        
         # Crear directorio temporal
         split_dir = "/tmp/split_files"
         os.makedirs(split_dir, exist_ok=True)
@@ -85,7 +75,7 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         if result.returncode != 0:
             logger.error(f"Error al dividir: {result.stderr}")
             await progress_msg.edit(f"[{task_id}] ❌ Error al dividir el archivo")
-            return  # CORRECCIÓN: Indentación corregida
+            return
         
         # Obtener partes generadas
         parts = sorted([f for f in os.listdir(split_dir) if f.startswith(f"{base_name}.7z.")])
@@ -103,10 +93,6 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         
         # Subir cada parte
         for i, part in enumerate(parts):
-            # Verificar si la tarea fue cancelada
-            if task_id in active_tasks and active_tasks[task_id].cancelled:
-                break
-                
             part_path = os.path.join(split_dir, part)
             
             # Crear callback de progreso para esta parte
@@ -126,10 +112,9 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
                 progress=progress_callback
             )
             
-            os.remove(part_path)  # CORRECCIÓN: Paréntesis extra removido
+            os.remove(part_path)
         
-        if task_id in active_tasks and not active_tasks[task_id].cancelled:
-            await progress_msg.edit(f"[{task_id}] ✅ Todos los fragmentos subidos correctamente")
+        await progress_msg.edit(f"[{task_id}] ✅ Todos los fragmentos subidos correctamente")
     
     except Exception as e:
         logger.error(f"Error en split_and_upload: {str(e)}", exc_info=True)
