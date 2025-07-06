@@ -16,7 +16,9 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         
         # Limpiar directorio
         for f in os.listdir(split_dir):
-            os.remove(os.path.join(split_dir, f))
+            file_path_to_remove = os.path.join(split_dir, f)
+            if os.path.isfile(file_path_to_remove):
+                os.remove(file_path_to_remove)
         
         # Nombre base para archivos divididos
         base_name = os.path.basename(file_path)
@@ -44,6 +46,15 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         
         # Obtener partes generadas
         parts = sorted([f for f in os.listdir(split_dir) if f.startswith(f"{base_name}.7z.")])
+        
+        if not parts:
+            # Si no se generaron partes, usar el archivo único
+            if os.path.exists(archive_path):
+                parts = [os.path.basename(archive_path)]
+        
+        if not parts:
+            await progress_msg.edit("❌ No se generaron partes")
+            return
         
         await progress_msg.edit(f"📦 Dividido en {len(parts)} partes. Subiendo...")
         
