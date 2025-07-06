@@ -1,10 +1,10 @@
 import os
 import asyncio
 import logging
-import math
+import shutil
 from pyrogram import Client
 from pyrogram.types import Message
-from py7zip import SevenZip
+from py7zip import SevenZipArchive  # Importación corregida
 
 logger = logging.getLogger(__name__)
 
@@ -29,22 +29,20 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         await progress_msg.edit("🔪 Dividiendo archivo con 7z (sin compresión)...")
         
         # Usar py7zip para crear el archivo dividido
-        zip = SevenZip()
-        zip.set_working_dir(split_dir)
-        zip.set_compression_level(0)  # Sin compresión
-        zip.set_volume_size(1990)  # Volúmenes de 1990MB
-        
-        # Agregar archivo al archivo 7z
-        zip.add_file(file_path, base_name)
-        
-        # Crear archivo multiparte
-        zip.create_archive(archive_path)
+        with SevenZipArchive(archive_path, 'w') as archive:
+            archive.set_compression_level(0)  # Sin compresión
+            archive.set_volume_size(1990 * 1024 * 1024)  # 1990 MB en bytes
+            archive.add_file(file_path, base_name)
         
         # Obtener partes generadas
         parts = sorted([
             f for f in os.listdir(split_dir) 
             if f.startswith(f"{base_name}.7z.") and f.endswith(('.001', '.002', '.003'))
         ])
+        
+        if not parts:
+            # Si no se generaron partes, usar el archivo único
+            parts = [f for f in os.listdir(split_dir) if f.endswith('.7z')]
         
         if not parts:
             await progress_msg.edit("❌ No se generaron partes")
@@ -74,3 +72,6 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         # Limpiar archivo original
         if os.path.exists(file_path):
             os.remove(file_path)
+        # Limpiar directorio temporal
+        if os.path.exists(split_dir):
+            shutil.rmtree(split_dir)
