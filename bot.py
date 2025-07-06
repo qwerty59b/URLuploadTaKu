@@ -106,20 +106,29 @@ async def download_content(url, custom_filename=None, progress_callback=None, ta
     return await download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id)
 
 async def download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id):
-    """Descarga contenido usando yt-dlp con concurrencia mejorada"""
+    """Descarga contenido usando yt-dlp con soporte para HLS/m3u8"""
     try:
-        # Formato predeterminado: intentar 720p primero, luego cualquier formato disponible
-        format_selector = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        # Configuración especial para enlaces HLS/m3u8
+        extra_params = []
+        if re.search(r'\.m3u8$', url, re.IGNORECASE):
+            extra_params = [
+                '--hls-use-mpegts',  # Usar contenedor MPEG-TS para segmentos HLS
+                '--downloader', 'ffmpeg',
+                '--downloader-args', 'ffmpeg:-c copy -bsf:a aac_adtstoasc'
+            ]
         
+        # Formato predeterminado: 720p o mejor disponible
         cmd = [
             "yt-dlp",
             "-o", f"{download_path}/%(title)s.%(ext)s",
             "--no-playlist",
             "--concurrent-fragments", "5",  # Fragmentos concurrentes
-            "--newline",  # Salida en formato nueva línea
-            "-f", format_selector,
+            "--hls-prefer-native",          # Usar descargador nativo para HLS
+            "--merge-output-format", "mp4", # Convertir a MP4 después de descargar
+            "--newline",                    # Salida en formato nueva línea
+            "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
             url
-        ]
+        ] + extra_params
         
         logger.info(f"Iniciando descarga yt-dlp: {' '.join(cmd)}")
         
@@ -139,6 +148,9 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         progress_pattern = re.compile(
             r'\[download\]\s+(\d+\.\d+)%.*?(\d+\.\d+)([KM]iB)/s.*?ETA\s+(\d+:\d+)'
         )
+        hls_pattern = re.compile(
+            r'\[download\]\s+(\d+\.\d+)%.*?(\d+\.\d+)([KM]iB)/s'
+        )
         
         last_progress_update = time.time()
         start_time = time.time()
@@ -147,17 +159,25 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         for line in iter(process.stdout.readline, ''):
             if progress_callback and task_id in active_tasks:
                 # Intentar extraer datos de progreso
-                match = progress_pattern.search(line)
+                match = progress_pattern.search(line) or hls_pattern.search(line)
                 if match:
                     percent = match.group(1)
-                    speed_value = match.group(2)
-                    speed_unit = match.group(3)
-                    eta = match.group(4)
+                    
+                    # Para HLS, la velocidad podría no estar siempre disponible
+                    if len(match.groups()) >= 3:
+                        speed_value = match.group(2)
+                        speed_unit = match.group(3)
+                        speed = f"{speed_value} {speed_unit}/s"
+                    else:
+                        speed = "calculando..."
+                    
+                    # Para HLS, ETA podría no estar disponible
+                    eta = match.group(4) if len(match.groups()) >= 4 else "calculando..."
                     
                     # Actualizar progreso
                     await progress_callback({
                         'percent': f"{percent}%",
-                        'speed': f"{speed_value} {speed_unit}/s",
+                        'speed': speed,
                         'eta': eta
                     })
                     last_progress_update = time.time()
@@ -195,10 +215,17 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         if not files:
             return None
             
+        # Encontrar el archivo más reciente
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(download_path, x)), reverse=True)
         original_file = os.path.join(download_path, files[0])
         
         # Renombrar si se especifica
         if custom_filename:
+            # Asegurar la extensión correcta
+            _, ext = os.path.splitext(original_file)
+            if not custom_filename.endswith(ext):
+                custom_filename += ext
+                
             new_file = os.path.join(download_path, custom_filename)
             os.rename(original_file, new_file)
             return new_file
@@ -266,7 +293,7 @@ def generate_thumbnail(video_path, task_id):
 async def start(client: Client, message: Message):
     await message.reply(
         "🤖 **Bot de Descargas Avanzado**\n\n"
-        "Envía un enlace directo a un archivo o video de YouTube/Facebook/Instagram\n\n"
+        "Envía un enlace directo a un archivo o video (YouTube, Facebook, Instagram, HLS/m3u8)\n\n"
         "También puedes agregar un nombre personalizado después del enlace:\n"
         "`https://ejemplo.com/video.mp4 | Mi Video Personalizado.mp4`\n\n"
         "Comandos disponibles:\n"
