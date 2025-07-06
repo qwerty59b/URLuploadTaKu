@@ -3,6 +3,7 @@ import subprocess
 import asyncio
 import time
 import re
+import logging
 from kunigram import Client, filters
 from kunigram.types import Message
 from split_upload import split_and_upload
@@ -12,7 +13,14 @@ API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
 BOT_TOKEN = os.environ['BOT_TOKEN']
 OWNER_ID = int(os.environ['OWNER_ID'])
-MAX_DIRECT_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+MAX_DIRECT_SIZE = 1990 * 1024 * 1024  # 1990 MB
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Client(
     "ytdlp_bot",
@@ -37,7 +45,10 @@ class DownloadProgress:
             self.last_update = current_time
             if text != self.progress_text:
                 self.progress_text = text
-                await self.message.edit(text)
+                try:
+                    await self.message.edit(text)
+                except Exception as e:
+                    logger.error(f"Error al actualizar progreso: {str(e)}")
 
 async def download_with_ytdlp(url, custom_filename=None, progress_callback=None):
     """Descarga contenido usando yt-dlp"""
@@ -89,7 +100,7 @@ async def download_with_ytdlp(url, custom_filename=None, progress_callback=None)
         return original_file
         
     except Exception as e:
-        print(f"Error en descarga: {e}")
+        logger.error(f"Error en descarga: {e}")
         return None
 
 @app.on_message(filters.command("start"))
@@ -99,7 +110,7 @@ async def start(client: Client, message: Message):
         "Envía un enlace de video para subirlo a Telegram\n\n"
         "Formatos soportados: MP4, M3U8, YouTube, etc.\n\n"
         "Para renombrar: `http://ejemplo.com/video.mp4 | mi_video.mp4`\n\n"
-        "Archivos >2GB se dividirán automáticamente"
+        "Archivos >1990MB se dividirán automáticamente"
     )
 
 @app.on_message(filters.command("update") & filters.private)
@@ -110,11 +121,41 @@ async def update_bot(client: Client, message: Message):
         return
         
     msg = await message.reply("🔄 Actualizando yt-dlp...")
-    update_cmd = ["pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]"]
-    subprocess.run(update_cmd, check=True)
+    log_file = "/tmp/update_error.log"
     
-    await msg.edit("✅ yt-dlp actualizado. Reiniciando bot...")
-    os._exit(0)  # Reinicio controlado
+    try:
+        # Actualizar yt-dlp
+        update_cmd = ["pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]"]
+        result = subprocess.run(
+            update_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            raise Exception(f"Error al actualizar: {result.stdout}")
+        
+        # Obtener versión actualizada
+        version_cmd = ["yt-dlp", "--version"]
+        version_result = subprocess.run(version_cmd, stdout=subprocess.PIPE, text=True)
+        version = version_result.stdout.strip()
+        
+        await msg.edit(f"✅ yt-dlp actualizado a la versión: {version}\nReiniciando bot...")
+        await asyncio.sleep(3)
+        os._exit(0)
+        
+    except Exception as e:
+        # Guardar log de error
+        with open(log_file, "w") as f:
+            f.write(str(e))
+        
+        await client.send_document(
+            chat_id=message.chat.id,
+            document=log_file,
+            caption="❌ Error al actualizar yt-dlp"
+        )
+        await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
 @app.on_message(filters.text & ~filters.command)
 async def handle_links(client: Client, message: Message):
@@ -142,15 +183,15 @@ async def handle_links(client: Client, message: Message):
         return
     
     file_size = os.path.getsize(file_path)
-    await msg.edit(f"✅ Descarga completa ({file_size/1024/1024:.2f} MB)\n⚡ Procesando...")
+    size_mb = file_size / (1024 * 1024)
     
-    try:
-        # Manejar archivos grandes (>2GB)
-        if file_size > MAX_DIRECT_SIZE:
-            await msg.edit("📦 Archivo muy grande, dividiendo...")
-            await split_and_upload(client, message, msg, file_path)
-        else:
-            await msg.edit("⬆️ Subiendo a Telegram...")
+    # Determinar si se necesita dividir
+    if file_size > MAX_DIRECT_SIZE:
+        await msg.edit(f"📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
+        await split_and_upload(client, message, msg, file_path)
+    else:
+        await msg.edit(f"✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
+        try:
             await client.send_document(
                 chat_id=message.chat.id,
                 document=file_path,
@@ -158,13 +199,11 @@ async def handle_links(client: Client, message: Message):
                 progress_args=(msg,)
             )
             await msg.edit("✅ Subida completada")
-    
-    except Exception as e:
-        await msg.edit(f"❌ Error: {str(e)}")
-    finally:
-        # Limpieza
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        except Exception as e:
+            await msg.edit(f"❌ Error en subida: {str(e)}")
+    # Limpieza
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
 async def upload_progress_callback(current, total, msg):
     """Muestra progreso de subida cada 20 segundos"""
@@ -176,8 +215,11 @@ async def upload_progress_callback(current, total, msg):
     if current_time - upload_progress_callback.last_update > 20:
         upload_progress_callback.last_update = current_time
         percent = current * 100 / total
-        await msg.edit(f"⬆️ Subiendo... {percent:.1f}%")
+        try:
+            await msg.edit(f"⬆️ Subiendo... {percent:.1f}%")
+        except Exception:
+            pass  # Ignorar errores de actualización
 
 if __name__ == "__main__":
-    print("⚡ Bot iniciado ⚡")
+    logger.info("⚡ Bot iniciado ⚡")
     app.run()
