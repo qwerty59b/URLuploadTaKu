@@ -46,10 +46,9 @@ async def split_upload_progress(current, total, progress_msg, task_id, part_inde
             logger.error(f"Error actualizando progreso: {str(e)}")
 
 async def split_and_upload(client: Client, message: Message, progress_msg: Message, file_path: str, task_id: str):
-    """Divide archivos grandes usando 7z (sin compresión) y sube a Telegram"""
     try:
-        # Verificar si la tarea fue cancelada
-        if task_id in active_tasks and active_tasks[task_id].cancelled:
+        # Mensaje actualizado
+        await progress_msg.edit(f"[{task_id}] 🔪 Dividiendo archivo...")
             return
         
         # Crear directorio temporal
