@@ -5,6 +5,9 @@ import time
 import re
 import logging
 import mimetypes
+import uuid
+import signal
+from collections import defaultdict
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from split_upload import split_and_upload
@@ -15,12 +18,16 @@ API_HASH = os.environ.get('API_HASH', '')
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 OWNER_ID = int(os.environ.get('OWNER_ID', 0))
 MAX_DIRECT_SIZE = 1990 * 1024 * 1024  # 1990 MB
+CONCURRENT_CONNECTIONS = 16  # Conexiones concurrentes para descargas
 
 # Configurar logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename='bot.log'
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -31,17 +38,27 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+# Almacenamiento de tareas activas
+active_tasks = {}
+task_counters = defaultdict(int)
+current_downloads = {}
+
 def is_owner(user_id):
     return user_id == OWNER_ID
 
 class DownloadProgress:
-    def __init__(self, message):
+    def __init__(self, message, task_id):
         self.message = message
         self.last_update = 0
         self.progress_text = ""
         self.start_time = time.time()
+        self.task_id = task_id
+        self.cancelled = False
 
     async def update(self, text):
+        if self.cancelled:
+            return
+            
         current_time = time.time()
         # Actualizar solo si han pasado más de 20 segundos
         if current_time - self.last_update > 20:
@@ -49,12 +66,38 @@ class DownloadProgress:
             if text != self.progress_text:
                 self.progress_text = text
                 try:
-                    await self.message.edit(text)
+                    await self.message.edit(f"[{self.task_id}] {text}")
                 except Exception as e:
                     logger.error(f"Error al actualizar progreso: {str(e)}")
 
-async def download_content(url, custom_filename=None, progress_callback=None):
-    """Descarga contenido usando wget o yt-dlp según el tipo de enlace"""
+def cancel_task(task_id):
+    """Cancela una tarea por su ID"""
+    if task_id in current_downloads:
+        logger.info(f"Cancelling task {task_id}")
+        # Matar el proceso asociado
+        process = current_downloads[task_id]
+        try:
+            if process.poll() is None:  # Si el proceso aún está en ejecución
+                process.terminate()
+                logger.info(f"Proceso {task_id} terminado")
+        except Exception as e:
+            logger.error(f"Error terminando proceso: {str(e)}")
+        
+        # Marcar progreso como cancelado
+        if task_id in active_tasks:
+            active_tasks[task_id].cancelled = True
+        
+        # Eliminar de las estructuras de seguimiento
+        if task_id in current_downloads:
+            del current_downloads[task_id]
+        if task_id in active_tasks:
+            del active_tasks[task_id]
+        
+        return True
+    return False
+
+async def download_content(url, custom_filename=None, progress_callback=None, task_id=None):
+    """Descarga contenido usando aria2c o yt-dlp según el tipo de enlace"""
     download_path = "/tmp/downloads"
     os.makedirs(download_path, exist_ok=True)
     
@@ -68,25 +111,31 @@ async def download_content(url, custom_filename=None, progress_callback=None):
     ])
     
     if is_direct:
-        # Descargar con wget
-        return await download_with_wget(url, download_path, custom_filename, progress_callback)
+        # Descargar con aria2c (más rápido y con soporte para múltiples conexiones)
+        return await download_with_aria2c(url, download_path, custom_filename, progress_callback, task_id)
     else:
         # Descargar con yt-dlp
-        return await download_with_ytdlp(url, download_path, custom_filename, progress_callback)
+        return await download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id)
 
-async def download_with_wget(url, download_path, custom_filename, progress_callback):
-    """Descarga contenido usando wget para enlaces directos"""
+async def download_with_aria2c(url, download_path, custom_filename, progress_callback, task_id):
+    """Descarga contenido usando aria2c para enlaces directos (más rápido)"""
     try:
         filename = custom_filename if custom_filename else os.path.basename(url)
         output_path = os.path.join(download_path, filename)
         
         cmd = [
-            "wget",
-            "-O", output_path,
-            "--progress=dot:giga",
-            "--no-check-certificate",
+            "aria2c",
+            "-x", str(CONCURRENT_CONNECTIONS),  # Número máximo de conexiones
+            "-s", str(CONCURRENT_CONNECTIONS),  # Número de conexiones por servidor
+            "-j", "5",  # Número máximo de descargas paralelas
+            "-c",  # Continuar descarga interrumpida
+            "--file-allocation=none",  # Sin pre-asignación de espacio (más rápido)
+            "-d", download_path,
+            "-o", filename,
             url
         ]
+        
+        logger.info(f"Iniciando descarga aria2c: {' '.join(cmd)}")
         
         process = subprocess.Popen(
             cmd,
@@ -95,46 +144,55 @@ async def download_with_wget(url, download_path, custom_filename, progress_callb
             universal_newlines=True
         )
         
+        # Registrar proceso para posible cancelación
+        current_downloads[task_id] = process
+        
         # Procesar salida para obtener progreso
         total_size = 0
         downloaded = 0
         
         for line in process.stdout:
-            if progress_callback:
+            if progress_callback and task_id in active_tasks and not active_tasks[task_id].cancelled:
                 # Buscar tamaño total
-                if "Length:" in line and "[" not in line:
+                if "Length:" in line:
                     size_match = re.search(r'Length: (\d+)', line)
                     if size_match:
                         total_size = int(size_match.group(1))
                 
                 # Buscar progreso actual
-                match = re.search(r'(\d+)%', line)
+                match = re.search(r'(\d+)%\)', line)
                 if match:
                     percent = match.group(1)
-                    downloaded = total_size * int(percent) / 100
                     await progress_callback(f"⏬ Descargando... {percent}%")
-                elif "saved" in line:
+                elif "download completed" in line:
                     await progress_callback("✅ Descarga completada")
         
         process.wait()
         if process.returncode != 0:
+            logger.error(f"Error en descarga aria2c: {process.returncode}")
             return None
         
         return output_path
         
     except Exception as e:
-        logger.error(f"Error en descarga wget: {e}")
+        logger.error(f"Error en descarga aria2c: {e}")
         return None
+    finally:
+        if task_id in current_downloads:
+            del current_downloads[task_id]
 
-async def download_with_ytdlp(url, download_path, custom_filename, progress_callback):
-    """Descarga contenido usando yt-dlp"""
+async def download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id):
+    """Descarga contenido usando yt-dlp con concurrencia mejorada"""
     try:
         cmd = [
             "yt-dlp",
             "-o", f"{download_path}/%(title)s.%(ext)s",
             "--no-playlist",
+            "--concurrent-fragments", "5",  # Fragmentos concurrentes
             url
         ]
+        
+        logger.info(f"Iniciando descarga yt-dlp: {' '.join(cmd)}")
         
         # Ejecutar yt-dlp capturando salida
         process = subprocess.Popen(
@@ -144,9 +202,12 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
             universal_newlines=True
         )
         
+        # Registrar proceso para posible cancelación
+        current_downloads[task_id] = process
+        
         # Procesar salida para obtener progreso
         for line in process.stdout:
-            if progress_callback:
+            if progress_callback and task_id in active_tasks and not active_tasks[task_id].cancelled:
                 if "ETA" in line and "]" in line:
                     # Extraer porcentaje de progreso
                     match = re.search(r'(\d+\.\d+)%', line)
@@ -156,6 +217,7 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         
         process.wait()
         if process.returncode != 0:
+            logger.error(f"Error en descarga yt-dlp: {process.returncode}")
             return None
         
         # Buscar el archivo descargado
@@ -175,6 +237,9 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
     except Exception as e:
         logger.error(f"Error en descarga yt-dlp: {e}")
         return None
+    finally:
+        if task_id in current_downloads:
+            del current_downloads[task_id]
 
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
@@ -186,7 +251,11 @@ async def start(client: Client, message: Message):
         "- Streams (M3U8, YouTube, etc.)\n"
         "- Archivos directos (ZIP, PDF, imágenes, etc.)\n\n"
         "Para renombrar: `http://ejemplo.com/archivo.mp4 | mi_archivo.mp4`\n\n"
-        "Archivos >1990MB se dividirán automáticamente"
+        "Archivos >1990MB se dividirán automáticamente\n\n"
+        "Comandos disponibles:\n"
+        "/start - Muestra este mensaje\n"
+        "/cancel [ID] - Cancela una tarea en progreso\n"
+        "/update - Actualiza herramientas (solo propietario)"
     )
 
 @app.on_message(filters.command("update") & filters.private)
@@ -204,7 +273,7 @@ async def update_bot(client: Client, message: Message):
         update_cmd = [
             "pip", "install", "--upgrade", 
             "yt-dlp[default,curl-cffi]", 
-            "wget"
+            "aria2c"
         ]
         result = subprocess.run(
             update_cmd,
@@ -221,14 +290,14 @@ async def update_bot(client: Client, message: Message):
         version_result = subprocess.run(version_cmd, stdout=subprocess.PIPE, text=True)
         ytdlp_version = version_result.stdout.strip()
         
-        wget_cmd = ["wget", "--version"]
-        wget_result = subprocess.run(wget_cmd, stdout=subprocess.PIPE, text=True)
-        wget_version = wget_result.stdout.split('\n')[0]
+        aria_cmd = ["aria2c", "--version"]
+        aria_result = subprocess.run(aria_cmd, stdout=subprocess.PIPE, text=True)
+        aria_version = aria_result.stdout.split('\n')[0]
         
         await msg.edit(
             f"✅ Herramientas actualizadas:\n"
             f"- yt-dlp: {ytdlp_version}\n"
-            f"- wget: {wget_version}\n\n"
+            f"- aria2c: {aria_version}\n\n"
             "Reiniciando bot..."
         )
         await asyncio.sleep(3)
@@ -246,7 +315,25 @@ async def update_bot(client: Client, message: Message):
         )
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
-# CORRECCIÓN: Filtro simplificado y eficiente
+@app.on_message(filters.command("cancel"))
+async def cancel_command(client: Client, message: Message):
+    """Cancela una tarea por ID"""
+    args = message.text.split()
+    if len(args) < 2:
+        active_list = "\n".join([f"- {task_id}" for task_id in active_tasks.keys()])
+        await message.reply(
+            f"❌ Uso: /cancel <ID>\n\n"
+            f"Tareas activas:\n{active_list if active_list else 'No hay tareas activas'}"
+        )
+        return
+    
+    task_id = args[1].strip()
+    if cancel_task(task_id):
+        await message.reply(f"✅ Tarea {task_id} cancelada correctamente")
+    else:
+        await message.reply("⚠️ ID de tarea no encontrada o ya completada")
+
+# Filtro para manejar enlaces
 @app.on_message(filters.text | filters.command)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
@@ -262,18 +349,32 @@ async def handle_links(client: Client, message: Message):
     if not url.startswith(("http://", "https://")):
         return
     
-    msg = await message.reply("⏬ Iniciando descarga...")
-    progress = DownloadProgress(msg)
+    # Generar ID único para la tarea
+    task_id = str(uuid.uuid4())[:8].upper()
+    task_counters[message.chat.id] += 1
+    
+    msg = await message.reply(f"[{task_id}] ⏬ Iniciando descarga...")
+    progress = DownloadProgress(msg, task_id)
+    active_tasks[task_id] = progress
     
     # Descargar contenido
     file_path = await download_content(
         url, 
         custom_name,
-        progress.update
+        progress.update,
+        task_id
     )
     
+    # Verificar si la tarea fue cancelada durante la descarga
+    if task_id not in active_tasks or active_tasks[task_id].cancelled:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return
+    
     if not file_path or not os.path.exists(file_path):
-        await msg.edit("❌ Error al descargar el contenido")
+        await msg.edit(f"[{task_id}] ❌ Error al descargar el contenido")
+        if task_id in active_tasks:
+            del active_tasks[task_id]
         return
     
     file_size = os.path.getsize(file_path)
@@ -281,10 +382,10 @@ async def handle_links(client: Client, message: Message):
     
     # Determinar si se necesita dividir
     if file_size > MAX_DIRECT_SIZE:
-        await msg.edit(f"📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
-        await split_and_upload(client, message, msg, file_path)
+        await msg.edit(f"[{task_id}] 📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
+        await split_and_upload(client, message, msg, file_path, task_id)
     else:
-        await msg.edit(f"✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
+        await msg.edit(f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
         try:
             # Detectar tipo MIME para enviar como video si es posible
             mime_type, _ = mimetypes.guess_type(file_path)
@@ -295,34 +396,46 @@ async def handle_links(client: Client, message: Message):
                     chat_id=message.chat.id,
                     video=file_path,
                     progress=upload_progress_callback,
-                    progress_args=(msg,)
+                    progress_args=(msg, task_id)
                 )
             else:
                 await client.send_document(
                     chat_id=message.chat.id,
                     document=file_path,
                     progress=upload_progress_callback,
-                    progress_args=(msg,)
+                    progress_args=(msg, task_id)
                 )
-            await msg.edit("✅ Subida completada")
+            await msg.edit(f"[{task_id}] ✅ Subida completada")
         except Exception as e:
-            await msg.edit(f"❌ Error en subida: {str(e)}")
+            await msg.edit(f"[{task_id}] ❌ Error en subida: {str(e)}")
+    
     # Limpieza
     if os.path.exists(file_path):
         os.remove(file_path)
+    
+    # Eliminar tarea de seguimiento
+    if task_id in active_tasks:
+        del active_tasks[task_id]
 
-async def upload_progress_callback(current, total, msg):
+async def upload_progress_callback(current, total, msg, task_id):
     """Muestra progreso de subida cada 20 segundos"""
     current_time = time.time()
     if not hasattr(upload_progress_callback, 'last_update'):
-        upload_progress_callback.last_update = 0
+        upload_progress_callback.last_update = {}
+    
+    if task_id not in upload_progress_callback.last_update:
+        upload_progress_callback.last_update[task_id] = 0
+    
+    # Verificar si la tarea fue cancelada
+    if task_id in active_tasks and active_tasks[task_id].cancelled:
+        return
     
     # Actualizar solo si han pasado más de 20 segundos
-    if current_time - upload_progress_callback.last_update > 20:
-        upload_progress_callback.last_update = current_time
+    if current_time - upload_progress_callback.last_update[task_id] > 20:
+        upload_progress_callback.last_update[task_id] = current_time
         percent = current * 100 / total
         try:
-            await msg.edit(f"⬆️ Subiendo... {percent:.1f}%")
+            await msg.edit(f"[{task_id}] ⬆️ Subiendo... {percent:.1f}%")
         except Exception:
             pass  # Ignorar errores de actualización
 
