@@ -9,9 +9,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
-    aria2 \
-    wget \
     p7zip-full \
+    aria2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Directorio de trabajo
