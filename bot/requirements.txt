@@ -1,3 +1,0 @@
-kunigram==2.3.0
-yt-dlp[default,curl-cffi]>=2025.6.25
-tqdm==4.66.4
