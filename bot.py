@@ -14,8 +14,8 @@ from split_upload import split_and_upload
 
 # Configuración
 API_ID = int(os.environ.get('API_ID', 0))
-API_HASH = os.environ.get('API_HASH', ''))
-BOT_TOKEN = os.environ.get('BOT_TOKEN', ''))
+API_HASH = os.environ.get('API_HASH', '')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 OWNER_ID = int(os.environ.get('OWNER_ID', 0))
 MAX_DIRECT_SIZE = 1990 * 1024 * 1024  # 1990 MB
 CONCURRENT_CONNECTIONS = 16  # Conexiones concurrentes para descargas
