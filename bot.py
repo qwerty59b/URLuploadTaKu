@@ -4,6 +4,7 @@ import asyncio
 import time
 import re
 import logging
+import mimetypes
 from kunigram import Client, filters
 from kunigram.types import Message
 from split_upload import split_and_upload
@@ -18,12 +19,13 @@ MAX_DIRECT_SIZE = 1990 * 1024 * 1024  # 1990 MB
 # Configurar logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename='bot.log'
 )
 logger = logging.getLogger(__name__)
 
 app = Client(
-    "ytdlp_bot",
+    "download_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
@@ -37,6 +39,7 @@ class DownloadProgress:
         self.message = message
         self.last_update = 0
         self.progress_text = ""
+        self.start_time = time.time()
 
     async def update(self, text):
         current_time = time.time()
@@ -50,19 +53,89 @@ class DownloadProgress:
                 except Exception as e:
                     logger.error(f"Error al actualizar progreso: {str(e)}")
 
-async def download_with_ytdlp(url, custom_filename=None, progress_callback=None):
-    """Descarga contenido usando yt-dlp"""
+async def download_content(url, custom_filename=None, progress_callback=None):
+    """Descarga contenido usando wget o yt-dlp según el tipo de enlace"""
     download_path = "/tmp/downloads"
     os.makedirs(download_path, exist_ok=True)
     
-    cmd = [
-        "yt-dlp",
-        "-o", f"{download_path}/%(title)s.%(ext)s",
-        "--no-playlist",
-        url
-    ]
+    # Determinar si es un enlace directo a archivo
+    is_direct = any(url.lower().endswith(ext) for ext in [
+        '.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', 
+        '.mp3', '.wav', '.ogg', '.m4a',
+        '.zip', '.rar', '.7z', '.tar', '.gz',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx',
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp'
+    ])
     
+    if is_direct:
+        # Descargar con wget
+        return await download_with_wget(url, download_path, custom_filename, progress_callback)
+    else:
+        # Descargar con yt-dlp
+        return await download_with_ytdlp(url, download_path, custom_filename, progress_callback)
+
+async def download_with_wget(url, download_path, custom_filename, progress_callback):
+    """Descarga contenido usando wget para enlaces directos"""
     try:
+        filename = custom_filename if custom_filename else os.path.basename(url)
+        output_path = os.path.join(download_path, filename)
+        
+        cmd = [
+            "wget",
+            "-O", output_path,
+            "--progress=dot:giga",
+            "--no-check-certificate",
+            url
+        ]
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True
+        )
+        
+        # Procesar salida para obtener progreso
+        total_size = 0
+        downloaded = 0
+        
+        for line in process.stdout:
+            if progress_callback:
+                # Buscar tamaño total
+                if "Length:" in line and "[" not in line:
+                    size_match = re.search(r'Length: (\d+)', line)
+                    if size_match:
+                        total_size = int(size_match.group(1))
+                
+                # Buscar progreso actual
+                match = re.search(r'(\d+)%', line)
+                if match:
+                    percent = match.group(1)
+                    downloaded = total_size * int(percent) / 100
+                    await progress_callback(f"⏬ Descargando... {percent}%")
+                elif "saved" in line:
+                    await progress_callback("✅ Descarga completada")
+        
+        process.wait()
+        if process.returncode != 0:
+            return None
+        
+        return output_path
+        
+    except Exception as e:
+        logger.error(f"Error en descarga wget: {e}")
+        return None
+
+async def download_with_ytdlp(url, download_path, custom_filename, progress_callback):
+    """Descarga contenido usando yt-dlp"""
+    try:
+        cmd = [
+            "yt-dlp",
+            "-o", f"{download_path}/%(title)s.%(ext)s",
+            "--no-playlist",
+            url
+        ]
+        
         # Ejecutar yt-dlp capturando salida
         process = subprocess.Popen(
             cmd, 
@@ -100,32 +173,39 @@ async def download_with_ytdlp(url, custom_filename=None, progress_callback=None)
         return original_file
         
     except Exception as e:
-        logger.error(f"Error en descarga: {e}")
+        logger.error(f"Error en descarga yt-dlp: {e}")
         return None
 
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     await message.reply(
         "🤖 **Bot de Descargas Avanzado**\n\n"
-        "Envía un enlace de video para subirlo a Telegram\n\n"
-        "Formatos soportados: MP4, M3U8, YouTube, etc.\n\n"
-        "Para renombrar: `http://ejemplo.com/video.mp4 | mi_video.mp4`\n\n"
+        "Envía un enlace para subir el archivo a Telegram\n\n"
+        "Soporte para:\n"
+        "- Videos (MP4, MKV, AVI, etc.)\n"
+        "- Streams (M3U8, YouTube, etc.)\n"
+        "- Archivos directos (ZIP, PDF, imágenes, etc.)\n\n"
+        "Para renombrar: `http://ejemplo.com/archivo.mp4 | mi_archivo.mp4`\n\n"
         "Archivos >1990MB se dividirán automáticamente"
     )
 
 @app.on_message(filters.command("update") & filters.private)
 async def update_bot(client: Client, message: Message):
-    """Actualiza yt-dlp y reinicia el bot (solo owner)"""
+    """Actualiza herramientas y reinicia el bot (solo owner)"""
     if not is_owner(message.from_user.id):
         await message.reply("❌ Solo el propietario puede usar este comando")
         return
         
-    msg = await message.reply("🔄 Actualizando yt-dlp...")
+    msg = await message.reply("🔄 Actualizando herramientas...")
     log_file = "/tmp/update_error.log"
     
     try:
-        # Actualizar yt-dlp
-        update_cmd = ["pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]"]
+        # Actualizar yt-dlp y wget
+        update_cmd = [
+            "pip", "install", "--upgrade", 
+            "yt-dlp[default,curl-cffi]", 
+            "wget"
+        ]
         result = subprocess.run(
             update_cmd,
             stdout=subprocess.PIPE,
@@ -136,12 +216,21 @@ async def update_bot(client: Client, message: Message):
         if result.returncode != 0:
             raise Exception(f"Error al actualizar: {result.stdout}")
         
-        # Obtener versión actualizada
+        # Obtener versiones
         version_cmd = ["yt-dlp", "--version"]
         version_result = subprocess.run(version_cmd, stdout=subprocess.PIPE, text=True)
-        version = version_result.stdout.strip()
+        ytdlp_version = version_result.stdout.strip()
         
-        await msg.edit(f"✅ yt-dlp actualizado a la versión: {version}\nReiniciando bot...")
+        wget_cmd = ["wget", "--version"]
+        wget_result = subprocess.run(wget_cmd, stdout=subprocess.PIPE, text=True)
+        wget_version = wget_result.stdout.split('\n')[0]
+        
+        await msg.edit(
+            f"✅ Herramientas actualizadas:\n"
+            f"- yt-dlp: {ytdlp_version}\n"
+            f"- wget: {wget_version}\n\n"
+            "Reiniciando bot..."
+        )
         await asyncio.sleep(3)
         os._exit(0)
         
@@ -153,13 +242,13 @@ async def update_bot(client: Client, message: Message):
         await client.send_document(
             chat_id=message.chat.id,
             document=log_file,
-            caption="❌ Error al actualizar yt-dlp"
+            caption="❌ Error al actualizar herramientas"
         )
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
 @app.on_message(filters.text & ~filters.command)
 async def handle_links(client: Client, message: Message):
-    """Procesa enlaces de video"""
+    """Procesa enlaces de archivos/videos"""
     user_input = message.text
     parts = user_input.split(" | ", 1)
     url = parts[0].strip()
@@ -171,8 +260,8 @@ async def handle_links(client: Client, message: Message):
     msg = await message.reply("⏬ Iniciando descarga...")
     progress = DownloadProgress(msg)
     
-    # Descargar con yt-dlp
-    file_path = await download_with_ytdlp(
+    # Descargar contenido
+    file_path = await download_content(
         url, 
         custom_name,
         progress.update
@@ -192,12 +281,24 @@ async def handle_links(client: Client, message: Message):
     else:
         await msg.edit(f"✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
         try:
-            await client.send_document(
-                chat_id=message.chat.id,
-                document=file_path,
-                progress=upload_progress_callback,
-                progress_args=(msg,)
-            )
+            # Detectar tipo MIME para enviar como video si es posible
+            mime_type, _ = mimetypes.guess_type(file_path)
+            is_video = mime_type and mime_type.startswith('video/')
+            
+            if is_video:
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=file_path,
+                    progress=upload_progress_callback,
+                    progress_args=(msg,)
+                )
+            else:
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    progress=upload_progress_callback,
+                    progress_args=(msg,)
+                )
             await msg.edit("✅ Subida completada")
         except Exception as e:
             await msg.edit(f"❌ Error en subida: {str(e)}")
