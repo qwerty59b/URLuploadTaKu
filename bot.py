@@ -7,9 +7,10 @@ import logging
 import mimetypes
 import uuid
 import json
+import urllib.parse
 from collections import defaultdict
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from split_upload import split_and_upload
 from datetime import datetime
 
@@ -38,11 +39,12 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# Almacenamiento de tareas activas
+# Almacenamiento de tareas y elecciones
 active_tasks = {}
 task_counters = defaultdict(int)
 current_downloads = {}
 user_active_tasks = {}
+pending_choices = {}
 
 def is_owner(user_id):
     return user_id == OWNER_ID
@@ -97,42 +99,118 @@ class DownloadProgress:
         minutes, seconds = divmod(remainder, 60)
         return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
 
-async def download_content(url, custom_filename=None, progress_callback=None, task_id=None):
-    """Descarga contenido usando yt-dlp para todos los tipos de enlaces"""
+async def download_content(url, custom_filename=None, progress_callback=None, task_id=None, method="yt-dlp"):
+    """Descarga contenido usando el método especificado"""
     download_path = "/tmp/downloads"
     os.makedirs(download_path, exist_ok=True)
     
-    # Usar yt-dlp para todos los tipos de enlaces
-    return await download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id)
+    if method == "aria2":
+        return await download_with_aria2(url, custom_filename, progress_callback, task_id)
+    else:
+        return await download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id)
+
+async def download_with_aria2(url, custom_filename, progress_callback, task_id):
+    """Descarga un archivo directo usando aria2 con 16 conexiones"""
+    download_path = "/tmp/downloads"
+    os.makedirs(download_path, exist_ok=True)
+    
+    # Determinar nombre de archivo
+    if custom_filename:
+        output_file = os.path.join(download_path, custom_filename)
+    else:
+        parsed_url = urllib.parse.urlparse(url)
+        filename = os.path.basename(parsed_url.path)
+        if not filename:
+            filename = str(uuid.uuid4())
+        output_file = os.path.join(download_path, filename)
+    
+    # Comando aria2c con 16 conexiones
+    cmd = [
+        "aria2c",
+        "-x", "16",
+        "-s", "16",
+        "-j", "16",
+        "-d", download_path,
+        "-o", os.path.basename(output_file),
+        url
+    ]
+    
+    logger.info(f"Ejecutando aria2c: {' '.join(cmd)}")
+    
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        # Registrar proceso
+        current_downloads[task_id] = process
+        
+        # Procesar salida para progreso
+        pattern = re.compile(r'(\d+)%[^(]*?(\d+\.\d+)([KM])iB/s.*?ETA:([\d:]+)')
+        
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+                
+            if progress_callback and task_id in active_tasks:
+                match = pattern.search(line)
+                if match:
+                    percent = match.group(1)
+                    speed = f"{match.group(2)} {match.group(3)}iB/s"
+                    eta = match.group(4)
+                    
+                    await progress_callback({
+                        'percent': f"{percent}%",
+                        'speed': speed,
+                        'eta': eta
+                    })
+        
+        process.wait()
+        if process.returncode != 0:
+            logger.error(f"Error en descarga aria2: {process.returncode}")
+            return None
+        
+        return output_file
+    except Exception as e:
+        logger.error(f"Error en descarga aria2: {e}")
+        return None
+    finally:
+        if task_id in current_downloads:
+            del current_downloads[task_id]
 
 async def download_with_ytdlp(url, download_path, custom_filename, progress_callback, task_id):
     """Descarga contenido usando yt-dlp con soporte para HLS/m3u8"""
     try:
         # Configuración especial para enlaces HLS/m3u8
         extra_params = []
-        if re.search(r'\.m3u8$', url, re.IGNORECASE):
+        if re.search(r'\.m3u8$|\.mpd$', url, re.IGNORECASE):
             extra_params = [
-                '--hls-use-mpegts',  # Usar contenedor MPEG-TS para segmentos HLS
+                '--hls-use-mpegts',
                 '--downloader', 'ffmpeg',
                 '--downloader-args', 'ffmpeg:-c copy -bsf:a aac_adtstoasc'
             ]
         
-        # Formato predeterminado: 720p o mejor disponible
+        # Formato predeterminado
         cmd = [
             "yt-dlp",
             "-o", f"{download_path}/%(title)s.%(ext)s",
             "--no-playlist",
-            "--concurrent-fragments", "5",  # Fragmentos concurrentes
-            "--hls-prefer-native",          # Usar descargador nativo para HLS
-            "--merge-output-format", "mp4", # Convertir a MP4 después de descargar
-            "--newline",                    # Salida en formato nueva línea
+            "--concurrent-fragments", "5",
+            "--hls-prefer-native",
+            "--merge-output-format", "mp4",
+            "--newline",
             "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
             url
         ] + extra_params
         
         logger.info(f"Iniciando descarga yt-dlp: {' '.join(cmd)}")
         
-        # Ejecutar yt-dlp capturando salida
+        # Ejecutar yt-dlp
         process = subprocess.Popen(
             cmd, 
             stdout=subprocess.PIPE,
@@ -141,7 +219,7 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
             bufsize=1
         )
         
-        # Registrar proceso para posible cancelación
+        # Registrar proceso
         current_downloads[task_id] = process
         
         # Procesar salida para obtener progreso
@@ -163,7 +241,6 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
                 if match:
                     percent = match.group(1)
                     
-                    # Para HLS, la velocidad podría no estar siempre disponible
                     if len(match.groups()) >= 3:
                         speed_value = match.group(2)
                         speed_unit = match.group(3)
@@ -171,10 +248,8 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
                     else:
                         speed = "calculando..."
                     
-                    # Para HLS, ETA podría no estar disponible
                     eta = match.group(4) if len(match.groups()) >= 4 else "calculando..."
                     
-                    # Actualizar progreso
                     await progress_callback({
                         'percent': f"{percent}%",
                         'speed': speed,
@@ -187,7 +262,6 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
                     match_percent = re.search(r'(\d+\.\d+)%', line)
                     if match_percent:
                         percent = match_percent.group(1)
-                        # Forzar actualización solo si hay cambio significativo
                         if abs(float(percent) - last_percent) > 5:
                             await progress_callback({
                                 'percent': f"{percent}%",
@@ -221,7 +295,6 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         
         # Renombrar si se especifica
         if custom_filename:
-            # Asegurar la extensión correcta
             _, ext = os.path.splitext(original_file)
             if not custom_filename.endswith(ext):
                 custom_filename += ext
@@ -313,10 +386,11 @@ async def update_bot(client: Client, message: Message):
     log_file = "/tmp/update_error.log"
     
     try:
-        # Actualizar solo yt-dlp
+        # Actualizar yt-dlp y aria2
         update_cmd = [
             "pip", "install", "--upgrade", 
-            "yt-dlp[default,curl-cffi]"
+            "yt-dlp[default,curl-cffi]",
+            "aria2p"
         ]
         result = subprocess.run(
             update_cmd,
@@ -328,14 +402,17 @@ async def update_bot(client: Client, message: Message):
         if result.returncode != 0:
             raise Exception(f"Error al actualizar: {result.stdout}")
         
-        # Obtener versión de yt-dlp
+        # Obtener versiones
         version_cmd = ["yt-dlp", "--version"]
         version_result = subprocess.run(version_cmd, stdout=subprocess.PIPE, text=True)
         ytdlp_version = version_result.stdout.strip()
         
+        aria2_version = subprocess.run(["aria2c", "--version"], capture_output=True, text=True).stdout.split('\n')[0]
+        
         await msg.edit(
             f"✅ Herramientas actualizadas:\n"
-            f"- yt-dlp: {ytdlp_version}\n\n"
+            f"- yt-dlp: {ytdlp_version}\n"
+            f"- aria2: {aria2_version}\n\n"
             "Reiniciando bot..."
         )
         await asyncio.sleep(3)
@@ -353,15 +430,12 @@ async def update_bot(client: Client, message: Message):
         )
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
-# Filtro para manejar enlaces
 @app.on_message(filters.text | filters.command)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
-    # Verificar si el mensaje contiene un comando
     if message.text.startswith('/'):
         return
     
-    # Verificar si el usuario ya tiene una tarea activa
     user_id = message.from_user.id
     if user_id in user_active_tasks:
         task_id_actual = user_active_tasks[user_id]
@@ -381,14 +455,59 @@ async def handle_links(client: Client, message: Message):
     if not url.startswith(("http://", "https://")):
         return
     
+    # Verificar si es un enlace directo
+    parsed_url = urllib.parse.urlparse(url)
+    is_direct = any(parsed_url.path.endswith(ext) for ext in ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.mp3', '.zip', '.rar'))
+    
+    # Crear teclado con opciones
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Aria2c (16 conexiones)", callback_data=f"aria2:{custom_name or ''}:{url}"),
+                InlineKeyboardButton("yt-dlp", callback_data=f"ytdlp:{custom_name or ''}:{url}")
+            ]
+        ]
+    )
+    
+    await message.reply(
+        "Selecciona el método de descarga:",
+        reply_markup=keyboard
+    )
+
+@app.on_callback_query(filters.regex(r'^(aria2|ytdlp):'))
+async def handle_download_choice(client, callback_query):
+    """Maneja la elección del método de descarga"""
+    user_id = callback_query.from_user.id
+    data = callback_query.data
+    
+    # Parsear datos del callback
+    parts = data.split(':', 2)
+    method = parts[0]
+    custom_name = parts[1] if parts[1] else None
+    url = parts[2]
+    
+    # Verificar si el usuario tiene tarea activa
+    if user_id in user_active_tasks:
+        task_id_actual = user_active_tasks[user_id]
+        if task_id_actual in active_tasks:
+            await callback_query.answer(
+                "Ya tienes una tarea activa. Espera a que termine.",
+                show_alert=True
+            )
+            return
+    
     # Generar ID único para la tarea
     task_id = str(uuid.uuid4())[:8].upper()
-    task_counters[message.chat.id] += 1
+    task_counters[callback_query.message.chat.id] += 1
     
-    # Registrar tarea para el usuario
+    # Registrar tarea
     user_active_tasks[user_id] = task_id
     
-    msg = await message.reply(f"[{task_id}] ⏬ Iniciando descarga...")
+    # Eliminar mensaje de selección
+    await callback_query.message.delete()
+    
+    # Iniciar mensaje de progreso
+    msg = await callback_query.message.reply(f"[{task_id}] ⏬ Iniciando descarga con {method}...")
     progress = DownloadProgress(msg, task_id)
     active_tasks[task_id] = progress
     
@@ -397,7 +516,8 @@ async def handle_links(client: Client, message: Message):
         url, 
         custom_name,
         progress.update,
-        task_id
+        task_id,
+        method=method
     )
     
     if not file_path or not os.path.exists(file_path):
@@ -414,11 +534,11 @@ async def handle_links(client: Client, message: Message):
     # Determinar si se necesita dividir
     if file_size > MAX_DIRECT_SIZE:
         await msg.edit(f"[{task_id}] 📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
-        await split_and_upload(client, message, msg, file_path, task_id)
+        await split_and_upload(client, callback_query.message, msg, file_path, task_id)
     else:
         await msg.edit(f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
         try:
-            # Detectar tipo MIME para enviar como video si es posible
+            # Detectar tipo MIME
             mime_type, _ = mimetypes.guess_type(file_path)
             is_video = mime_type and mime_type.startswith('video/')
             
@@ -444,7 +564,7 @@ async def handle_links(client: Client, message: Message):
                     caption = f"📹 {os.path.basename(file_path)}"
                 
                 await client.send_video(
-                    chat_id=message.chat.id,
+                    chat_id=callback_query.message.chat.id,
                     video=file_path,
                     caption=caption,
                     duration=duration,
@@ -458,7 +578,7 @@ async def handle_links(client: Client, message: Message):
                     os.remove(thumb)
             else:
                 await client.send_document(
-                    chat_id=message.chat.id,
+                    chat_id=callback_query.message.chat.id,
                     document=file_path,
                     progress=upload_progress_callback,
                     progress_args=(msg, task_id)
