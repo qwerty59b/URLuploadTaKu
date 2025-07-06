@@ -1,4 +1,5 @@
-kunigram==2.3.0
+pyrofork~=2.3.40
+TgCrypto-pyrofork~=1.2.6
 yt-dlp[default,curl-cffi]>=2025.6.25
-wget==3.2
+wget>=3.2
 p7zip-full==16.02
