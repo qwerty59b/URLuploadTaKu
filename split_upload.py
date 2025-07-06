@@ -1,10 +1,9 @@
 import os
 import asyncio
 import logging
-import shutil
+import subprocess
 from pyrogram import Client
 from pyrogram.types import Message
-from py7zip import SevenZipArchive  # Importación corregida
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +16,7 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         
         # Limpiar directorio
         for f in os.listdir(split_dir):
-            file_to_remove = os.path.join(split_dir, f)
-            if os.path.isfile(file_to_remove):
-                os.remove(file_to_remove)
+            os.remove(os.path.join(split_dir, f))
         
         # Nombre base para archivos divididos
         base_name = os.path.basename(file_path)
@@ -28,25 +25,25 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         # Crear archivo 7z sin compresión (modo almacenamiento)
         await progress_msg.edit("🔪 Dividiendo archivo con 7z (sin compresión)...")
         
-        # Usar py7zip para crear el archivo dividido
-        with SevenZipArchive(archive_path, 'w') as archive:
-            archive.set_compression_level(0)  # Sin compresión
-            archive.set_volume_size(1990 * 1024 * 1024)  # 1990 MB en bytes
-            archive.add_file(file_path, base_name)
+        # Usar binario 7z directamente
+        cmd = [
+            "7z",
+            "a",
+            f"-v{1990}m",  # Volúmenes de 1990MB
+            "-mx0",        # Sin compresión
+            archive_path,
+            file_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logger.error(f"Error al dividir: {result.stderr}")
+            await progress_msg.edit("❌ Error al dividir el archivo")
+            return
         
         # Obtener partes generadas
-        parts = sorted([
-            f for f in os.listdir(split_dir) 
-            if f.startswith(f"{base_name}.7z.") and f.endswith(('.001', '.002', '.003'))
-        ])
-        
-        if not parts:
-            # Si no se generaron partes, usar el archivo único
-            parts = [f for f in os.listdir(split_dir) if f.endswith('.7z')]
-        
-        if not parts:
-            await progress_msg.edit("❌ No se generaron partes")
-            return
+        parts = sorted([f for f in os.listdir(split_dir) if f.startswith(f"{base_name}.7z.")])
         
         await progress_msg.edit(f"📦 Dividido en {len(parts)} partes. Subiendo...")
         
@@ -72,6 +69,3 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         # Limpiar archivo original
         if os.path.exists(file_path):
             os.remove(file_path)
-        # Limpiar directorio temporal
-        if os.path.exists(split_dir):
-            shutil.rmtree(split_dir)
