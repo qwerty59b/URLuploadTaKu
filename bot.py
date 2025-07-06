@@ -650,11 +650,16 @@ async def clean_pending_choices():
         for choice_id in expired:
             del pending_choices[choice_id]
 
-# Manejador para iniciar tareas en segundo plano cuando el bot arranca
-@app.on_start()
-async def on_start(client):
-    client.loop.create_task(clean_pending_choices())
-
 if __name__ == "__main__":
     logger.info("⚡ Bot iniciado con Pyrofork ⚡")
-    app.run()  # Solo esta línea para iniciar el bot
+    
+    # Crear tarea de limpieza después de iniciar el cliente
+    async def main():
+        await app.start()
+        asyncio.create_task(clean_pending_choices())
+        await asyncio.Event().wait()  # Mantener el bot en ejecución
+        
+    try:
+        app.run(main())
+    finally:
+        app.stop()
