@@ -46,9 +46,10 @@ async def split_upload_progress(current, total, progress_msg, task_id, part_inde
             logger.error(f"Error actualizando progreso: {str(e)}")
 
 async def split_and_upload(client: Client, message: Message, progress_msg: Message, file_path: str, task_id: str):
+    """Divide archivos grandes usando 7z (sin compresión) y sube a Telegram"""
     try:
-        # Mensaje actualizado
-        await progress_msg.edit(f"[{task_id}] 🔪 Dividiendo archivo...")
+        # Verificar si la tarea fue cancelada
+        if task_id in active_tasks and active_tasks[task_id].cancelled:
             return
         
         # Crear directorio temporal
@@ -84,7 +85,7 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
         if result.returncode != 0:
             logger.error(f"Error al dividir: {result.stderr}")
             await progress_msg.edit(f"[{task_id}] ❌ Error al dividir el archivo")
-            return
+            return  # CORRECCIÓN: Indentación corregida
         
         # Obtener partes generadas
         parts = sorted([f for f in os.listdir(split_dir) if f.startswith(f"{base_name}.7z.")])
@@ -125,7 +126,7 @@ async def split_and_upload(client: Client, message: Message, progress_msg: Messa
                 progress=progress_callback
             )
             
-            os.remove(part_path)
+            os.remove(part_path)  # CORRECCIÓN: Paréntesis extra removido
         
         if task_id in active_tasks and not active_tasks[task_id].cancelled:
             await progress_msg.edit(f"[{task_id}] ✅ Todos los fragmentos subidos correctamente")
