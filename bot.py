@@ -247,7 +247,7 @@ async def update_bot(client: Client, message: Message):
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
 # CORRECCIÓN IMPORTANTE: Cambiamos el filtro para manejar enlaces
-@app.on_message(filters.text & ~filters.command & ~filters.edited)
+@app.on_message(filters.text | filters.command | filters.edited)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
     # Verificar si el mensaje contiene un comando
