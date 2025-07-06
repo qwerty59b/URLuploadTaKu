@@ -10,10 +10,10 @@ from pyrogram.types import Message
 from split_upload import split_and_upload
 
 # Configuración
-API_ID = int(os.environ['API_ID'])
-API_HASH = os.environ['API_HASH']
-BOT_TOKEN = os.environ['BOT_TOKEN']
-OWNER_ID = int(os.environ['OWNER_ID'])
+API_ID = int(os.environ.get('API_ID', 0))
+API_HASH = os.environ.get('API_HASH', '')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+OWNER_ID = int(os.environ.get('OWNER_ID', 0))
 MAX_DIRECT_SIZE = 1990 * 1024 * 1024  # 1990 MB
 
 # Configurar logging
@@ -246,9 +246,14 @@ async def update_bot(client: Client, message: Message):
         )
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
-@app.on_message(filters.text & ~filters.command)
+# CORRECCIÓN IMPORTANTE: Cambiamos el filtro para manejar enlaces
+@app.on_message(filters.text & ~filters.command & ~filters.edited)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
+    # Verificar si el mensaje contiene un comando
+    if message.text.startswith('/'):
+        return
+    
     user_input = message.text
     parts = user_input.split(" | ", 1)
     url = parts[0].strip()
@@ -322,5 +327,5 @@ async def upload_progress_callback(current, total, msg):
             pass  # Ignorar errores de actualización
 
 if __name__ == "__main__":
-    logger.info("⚡ Bot iniciado ⚡")
+    logger.info("⚡ Bot iniciado con Pyrofork ⚡")
     app.run()
