@@ -7,6 +7,12 @@ from pyrogram.types import Message
 
 logger = logging.getLogger(__name__)
 
+# Acceso a active_tasks desde bot.py (necesario para cancelaciones)
+try:
+    from bot import active_tasks
+except ImportError:
+    active_tasks = {}
+
 async def split_and_upload(client: Client, message: Message, progress_msg: Message, file_path: str, task_id: str):
     """Divide archivos grandes usando 7z (sin compresión) y sube a Telegram"""
     try:
