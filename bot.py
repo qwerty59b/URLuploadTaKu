@@ -55,15 +55,11 @@ class DownloadProgress:
         self.progress_text = ""
         self.start_time = time.time()
         self.task_id = task_id
-        self.cancelled = False
         self.last_percent = 0
         self.last_speed = ""
         self.last_eta = ""
 
     async def update(self, data):
-        if self.cancelled:
-            return
-            
         current_time = time.time()
         # Actualizar solo si han pasado más de 15 segundos o si hay cambios importantes
         if current_time - self.last_update > 15 or 'force' in data:
@@ -101,43 +97,6 @@ class DownloadProgress:
         hours, remainder = divmod(seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
-
-def cancel_task(task_id):
-    """Cancela una tarea por su ID (función interna)"""
-    if task_id in current_downloads:
-        logger.info(f"Cancelando tarea {task_id}...")
-        # Matar el proceso asociado
-        process = current_downloads[task_id]
-        try:
-            if process.poll() is None:  # Si el proceso aún está en ejecución
-                process.terminate()
-                logger.info(f"Proceso {task_id} terminado")
-                # Esperar y forzar si es necesario
-                time.sleep(2)
-                if process.poll() is None:
-                    process.kill()
-                    logger.info(f"Proceso {task_id} forzado")
-        except Exception as e:
-            logger.error(f"Error terminando proceso: {str(e)}")
-        
-        # Marcar progreso como cancelado
-        if task_id in active_tasks:
-            active_tasks[task_id].cancelled = True
-        
-        # Eliminar de las estructuras de seguimiento
-        if task_id in current_downloads:
-            del current_downloads[task_id]
-        if task_id in active_tasks:
-            del active_tasks[task_id]
-        
-        # Eliminar de tareas de usuario
-        for user_id, t_id in list(user_active_tasks.items()):
-            if t_id == task_id:
-                del user_active_tasks[user_id]
-                break
-        
-        return True
-    return False
 
 async def download_content(url, custom_filename=None, progress_callback=None, task_id=None, format_id=None):
     """Descarga contenido usando yt-dlp para todos los tipos de enlaces"""
@@ -186,7 +145,7 @@ async def download_with_ytdlp(url, download_path, custom_filename, progress_call
         last_percent = 0
         
         for line in iter(process.stdout.readline, ''):
-            if progress_callback and task_id in active_tasks and not active_tasks[task_id].cancelled:
+            if progress_callback and task_id in active_tasks:
                 # Intentar extraer datos de progreso
                 match = progress_pattern.search(line)
                 if match:
@@ -361,10 +320,11 @@ def parse_formats(output):
 async def start(client: Client, message: Message):
     await message.reply(
         "🤖 **Bot de Descargas Avanzado**\n\n"
-        # ... (texto existente)
+        "Envía un enlace directo a un archivo o video de YouTube/Facebook/Instagram\n\n"
+        "También puedes agregar un nombre personalizado después del enlace:\n"
+        "`https://ejemplo.com/video.mp4 | Mi Video Personalizado.mp4`\n\n"
         "Comandos disponibles:\n"
         "/start - Muestra este mensaje\n"
-        "/cancel - Cancela tu tarea en progreso\n"  # Actualizado
         "/update - Actualiza herramientas (solo propietario)\n\n"
         "⚠️ Solo puedes tener 1 tarea activa a la vez"
     )
@@ -420,28 +380,6 @@ async def update_bot(client: Client, message: Message):
         )
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
-@app.on_message(filters.command("cancel"))
-async def cancel_command(client: Client, message: Message):
-    """Cancela la tarea activa del usuario actual"""
-    user_id = message.from_user.id
-    
-    # Verificar si el usuario tiene una tarea activa
-    if user_id in user_active_tasks:
-        task_id = user_active_tasks[user_id]
-        if cancel_task(task_id):
-            await message.reply(f"✅ Tu tarea activa (ID: `{task_id}`) ha sido cancelada.")
-        else:
-            await message.reply("⚠️ No se pudo cancelar la tarea. Puede que ya haya finalizado.")
-    else:
-        await message.reply("ℹ️ No tienes ninguna tarea activa para cancelar.")
-
-    
-    task_id = args[1].strip()
-    if cancel_task(task_id):
-        await message.reply(f"✅ Tarea {task_id} cancelada correctamente")
-    else:
-        await message.reply("⚠️ ID de tarea no encontrada o ya completada")
-
 @app.on_callback_query()
 async def handle_quality_selection(client: Client, callback_query):
     """Maneja la selección de calidad/formato"""
@@ -453,11 +391,6 @@ async def handle_quality_selection(client: Client, callback_query):
         return
     
     context = pending_quality_selection[user_id]
-    
-    if data == "cancel_quality":
-        await callback_query.message.edit("❌ Descarga cancelada")
-        del pending_quality_selection[user_id]
-        return
     
     # Extraer el ID de formato
     format_id = data.split("_")[1]
@@ -483,9 +416,86 @@ async def handle_quality_selection(client: Client, callback_query):
         format_id
     )
     
-    # Procesar el archivo descargado (igual que en handle_links)
-    # ... (código similar al final de handle_links)
+    # Procesar el archivo descargado
+    if not file_path or not os.path.exists(file_path):
+        await callback_query.message.edit(f"[{task_id}] ❌ Error al descargar el contenido")
+        if task_id in active_tasks:
+            del active_tasks[task_id]
+        if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
+            del user_active_tasks[user_id]
+        return
     
+    file_size = os.path.getsize(file_path)
+    size_mb = file_size / (1024 * 1024)
+    
+    # Determinar si se necesita dividir
+    if file_size > MAX_DIRECT_SIZE:
+        await callback_query.message.edit(f"[{task_id}] 📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
+        await split_and_upload(client, callback_query.message, callback_query.message, file_path, task_id)
+    else:
+        await callback_query.message.edit(f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
+        try:
+            # Detectar tipo MIME para enviar como video si es posible
+            mime_type, _ = mimetypes.guess_type(file_path)
+            is_video = mime_type and mime_type.startswith('video/')
+            
+            if is_video:
+                # Obtener metadatos del video
+                metadata = get_video_metadata(file_path)
+                duration = 0
+                thumb = None
+                
+                if metadata:
+                    duration = int(metadata['duration'])
+                    size_mb = metadata['size'] / (1024 * 1024)
+                    caption = (
+                        f"📹 {os.path.basename(file_path)}\n"
+                        f"💾 {size_mb:.2f} MB\n"
+                        f"🖥️ {metadata['resolution']}\n"
+                        f"⏱️ {duration} seg"
+                    )
+                    
+                    # Generar miniatura
+                    thumb = generate_thumbnail(file_path, task_id)
+                else:
+                    caption = f"📹 {os.path.basename(file_path)}"
+                
+                await client.send_video(
+                    chat_id=callback_query.message.chat.id,
+                    video=file_path,
+                    caption=caption,
+                    duration=duration,
+                    thumb=thumb,
+                    progress=upload_progress_callback,
+                    progress_args=(callback_query.message, task_id)
+                )
+                
+                # Eliminar miniatura temporal
+                if thumb and os.path.exists(thumb):
+                    os.remove(thumb)
+            else:
+                await client.send_document(
+                    chat_id=callback_query.message.chat.id,
+                    document=file_path,
+                    progress=upload_progress_callback,
+                    progress_args=(callback_query.message, task_id)
+                )
+            await callback_query.message.edit(f"[{task_id}] ✅ Subida completada")
+        except Exception as e:
+            await callback_query.message.edit(f"[{task_id}] ❌ Error en subida: {str(e)}")
+    
+    # Limpieza
+    if file_path and os.path.exists(file_path):
+        os.remove(file_path)
+    
+    # Eliminar tarea de seguimiento
+    if task_id in active_tasks:
+        del active_tasks[task_id]
+    
+    # Liberar usuario al finalizar la tarea
+    if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
+        del user_active_tasks[user_id]
+
     # Limpiar selección pendiente
     del pending_quality_selection[user_id]
 
@@ -505,8 +515,7 @@ async def handle_links(client: Client, message: Message):
             await message.reply(
                 "⚠️ Ya tienes una tarea en curso.\n"
                 f"ID de tarea actual: `{task_id_actual}`\n\n"
-                "Espera a que finalice o cancélala con:\n"
-                "`/cancel`"  # Cambiado a comando simple
+                "Por favor espera a que finalice."
             )
             return
     
@@ -545,8 +554,6 @@ async def handle_links(client: Client, message: Message):
                     btn_text = f"{fmt['resolution']} - {fmt['note'][:20]}"
                     buttons.append([InlineKeyboardButton(btn_text, callback_data=f"format_{fmt['id']}")])
                 
-                buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel_quality")])
-                
                 keyboard = InlineKeyboardMarkup(buttons)
                 
                 await message.reply(
@@ -574,20 +581,10 @@ async def handle_links(client: Client, message: Message):
         task_id
     )
     
-    # Verificar si la tarea fue cancelada durante la descarga
-    if task_id not in active_tasks or active_tasks[task_id].cancelled:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        # Limpiar registro de usuario si fue cancelada
-        if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
-            del user_active_tasks[user_id]
-        return
-    
     if not file_path or not os.path.exists(file_path):
         await msg.edit(f"[{task_id}] ❌ Error al descargar el contenido")
         if task_id in active_tasks:
             del active_tasks[task_id]
-        # Limpiar registro de usuario
         if user_id in user_active_tasks and user_active_tasks[user_id] == task_id:
             del user_active_tasks[user_id]
         return
@@ -671,10 +668,6 @@ async def upload_progress_callback(current, total, msg, task_id):
     
     if task_id not in upload_progress_callback.last_update:
         upload_progress_callback.last_update[task_id] = 0
-    
-    # Verificar si la tarea fue cancelada
-    if task_id in active_tasks and active_tasks[task_id].cancelled:
-        return
     
     # Actualizar cada 15 segundos
     if current_time - upload_progress_callback.last_update[task_id] > 15:
