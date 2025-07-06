@@ -247,7 +247,7 @@ async def update_bot(client: Client, message: Message):
         await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
 
 # CORRECCIÓN: Filtro simplificado y eficiente
-@app.on_message(filters.text & ~filters.command)
+@app.on_message(filters.text | filters.command)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
     # Verificar si el mensaje contiene un comando
