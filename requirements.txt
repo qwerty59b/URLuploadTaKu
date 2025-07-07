@@ -1,7 +1,4 @@
 pyrofork~=2.3.40
 TgCrypto-pyrofork~=1.2.6
 yt-dlp[default,curl-cffi]>=2025.6.25
-tqdm==4.66.1
-py7zr>=0.20.5
-requests>=2.31.0
-ffmpeg-python==0.2.0
+
