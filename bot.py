@@ -49,6 +49,7 @@ active_tasks = {}
 queued_tasks = {}
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 progress_last_update = {}
+user_active_tasks = {}  # Inicialización añadida
 
 # Lista de dominios compatibles con yt-dlp (ejemplos principales)
 YTDLP_DOMAINS = [
@@ -553,17 +554,15 @@ async def update_bot(client: Client, message: Message):
 @app.on_message(filters.text | filters.command)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
-    # Verificar si el mensaje contiene un comando
     if message.text.startswith('/'):
         return
     
-    # Verificar si el usuario ya tiene una tarea activa
     user_id = message.from_user.id
     if user_id in user_active_tasks:
         task_id_actual = user_active_tasks[user_id]
-        if task_id_actual in active_tasks:
+        if task_id_actual in active_tasks or task_id_actual in queued_tasks:
             await message.reply(
-                "⚠️ Ya tienes una tarea en curso.\n"
+                "⚠️ Ya tienes una tarea en curso o en cola.\n"
                 f"ID de tarea actual: `{task_id_actual}`\n\n"
                 "Por favor espera a que finalice."
             )
@@ -579,9 +578,6 @@ async def handle_links(client: Client, message: Message):
     
     # Generar ID único para la tarea
     task_id = str(uuid.uuid4())[:8].upper()
-    task_counters[message.chat.id] += 1
-    
-    # Registrar tarea para el usuario
     user_active_tasks[user_id] = task_id
     
     # Obtener nombre de archivo
@@ -590,8 +586,22 @@ async def handle_links(client: Client, message: Message):
     original_filename = os.path.basename(path) or "file"
     filename = custom_name or original_filename
     
-    msg = await message.reply(f"[{task_id}] ⏬ Iniciando descarga...")
-    start_time = time.time()
+    msg = await message.reply(f"[{task_id}] ⏳ Tarea añadida a la cola. Posición: {task_queue.qsize()+1}")
+    
+    # Crear datos de tarea
+    task_data = {
+        'url': url,
+        'custom_name': custom_name,
+        'message': message,
+        'msg': msg,
+        'task_id': task_id,
+        'user_id': user_id
+    }
+    
+    # Añadir a la cola
+    await task_queue.put(task_data)
+    queued_tasks[task_id] = task_data
+
     
     # Configurar callback de progreso
     async def progress_callback(current, total, status, progress_msg, name, tid, stime):
