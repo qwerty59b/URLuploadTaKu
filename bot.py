@@ -10,11 +10,10 @@ import json
 import math
 import humanize
 import aiohttp
-from collections import defaultdict
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.errors import FloodWait
 from split_upload import split_and_upload
-from datetime import datetime
 from urllib.parse import urlparse, unquote, parse_qs
 
 # Configuración
@@ -35,6 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suprimir advertencias específicas de FloodWait
+logging.getLogger("pyrogram.session.session").setLevel(logging.ERROR)
+
 app = Client(
     "download_bot",
     api_id=API_ID,
@@ -45,9 +47,9 @@ app = Client(
 # Sistema de seguimiento de tareas
 active_tasks = {}
 progress_last_update = {}
-user_active_tasks = {}  # Seguimiento de tareas por usuario
+user_active_tasks = {}
 
-# Lista de dominios compatibles con yt-dlp (ejemplos principales)
+# Lista de dominios compatibles con yt-dlp
 YTDLP_DOMAINS = [
     "youtube.com", "youtu.be", "facebook.com", "instagram.com", 
     "twitter.com", "tiktok.com", "twitch.tv", "vimeo.com",
@@ -59,12 +61,10 @@ def is_owner(user_id):
 
 def requires_ytdlp(url):
     """Determina si la URL requiere yt-dlp para descargar"""
-    # Verificar palabras clave en la URL
     url_lower = url.lower()
     if any(key in url_lower for key in ["m3u8", "hls", "mpd", "dash"]):
         return True
     
-    # Verificar dominios compatibles
     try:
         domain = urlparse(url).netloc.lower()
         return any(d in domain for d in YTDLP_DOMAINS)
@@ -72,18 +72,16 @@ def requires_ytdlp(url):
         return False
 
 def get_filename_from_url(url):
-    """Extrae el nombre de archivo desde la URL con manejo de errores"""
+    """Extrae el nombre de archivo desde la URL"""
     try:
         parsed = urlparse(url)
         path = unquote(parsed.path)
         
-        # Buscar nombre de archivo en la ruta
         if "/" in path:
             filename = path.split("/")[-1]
             if "." in filename and len(filename) > 4:
                 return filename
         
-        # Buscar en parámetros de consulta
         query = parse_qs(parsed.query)
         for key in ["filename", "name", "file"]:
             if key in query:
@@ -93,7 +91,7 @@ def get_filename_from_url(url):
     except Exception as e:
         logger.error(f"Error extrayendo nombre: {str(e)}")
     
-    # Nombres por defecto basados en tipo de contenido
+    # Nombres por defecto
     if "video" in url:
         return "video.mp4"
     elif "audio" in url:
@@ -102,6 +100,17 @@ def get_filename_from_url(url):
         return "image.jpg"
     
     return f"archivo_{int(time.time())}.bin"
+
+async def safe_edit_message(message: Message, text: str):
+    """Edita un mensaje de forma segura manejando FloodWait"""
+    try:
+        await message.edit(text)
+    except FloodWait as e:
+        logger.warning(f"FloodWait: Esperando {e.value} segundos")
+        await asyncio.sleep(e.value)
+        await message.edit(text)
+    except Exception as e:
+        logger.error(f"Error editando mensaje: {str(e)}")
 
 async def progress_bar(
     current: int, 
@@ -112,45 +121,46 @@ async def progress_bar(
     task_id: str, 
     start_time: float
 ):
-    """Muestra una barra de progreso similar a main.py"""
+    """Muestra una barra de progreso con manejo de FloodWait"""
     present = time.time()
     key = f"{task_id}_{status_msg}"
     
-    # Actualizar solo si han pasado >5 segundos o es la última actualización
-    if key not in progress_last_update:
-        progress_last_update[key] = 0
+    # Actualizar máximo cada 20 segundos o al completar
+    last_update = progress_last_update.get(key, 0)
+    if present - last_update < 20 and current != total:
+        return
         
-    if present - progress_last_update[key] > 15 or current == total:
-        progress_last_update[key] = present
-        
-        try:
-            speed = current / (present - start_time) if present - start_time > 0 else 0
-            percentage = current * 100 / total if total > 0 else 0
-            time_to_complete = round(((total - current) / speed)) if speed > 0 else 0
-            time_to_complete_str = humanize.naturaldelta(time_to_complete)
+    progress_last_update[key] = present
+    
+    try:
+        elapsed = present - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        percentage = current * 100 / total if total > 0 else 0
+        time_to_complete = round((total - current) / speed) if speed > 0 else 0
+        time_to_complete_str = humanize.naturaldelta(time_to_complete)
 
-            progressbar = "[{0}{1}]".format(
-                "".join(["🟢" for _ in range(math.floor(percentage / 10))]),
-                "".join(["⚫" for _ in range(10 - math.floor(percentage / 10))]),
-            )
+        progressbar = "[{0}{1}]".format(
+            "".join(["🟢" for _ in range(math.floor(percentage / 10))]),
+            "".join(["⚫" for _ in range(10 - math.floor(percentage / 10))]),
+        )
 
-            current_message = (
-                f"[{task_id}] **{status_msg}**\n"
-                f"**{filename}**\n"
-                f"📊 {round(percentage, 2)}%\n"
-                f"{progressbar}\n"
-                f"**⚡ Speed**: {humanize.naturalsize(speed)}/s\n"
-                f"**📚 Done**: {humanize.naturalsize(current)}\n"
-                f"**💾 Size**: {humanize.naturalsize(total)}\n"
-                f"**⏰ Time Left**: {time_to_complete_str}"
-            )
+        current_message = (
+            f"[{task_id}] **{status_msg}**\n"
+            f"**{filename}**\n"
+            f"📊 {round(percentage, 2)}%\n"
+            f"{progressbar}\n"
+            f"**⚡ Velocidad**: {humanize.naturalsize(speed)}/s\n"
+            f"**📚 Progreso**: {humanize.naturalsize(current)}\n"
+            f"**💾 Tamaño**: {humanize.naturalsize(total)}\n"
+            f"**⏰ Tiempo restante**: {time_to_complete_str}"
+        )
 
-            await progress_message.edit(current_message)
-        except Exception as e:
-            logger.error(f"Error updating progress: {str(e)}")
+        await safe_edit_message(progress_message, current_message)
+    except Exception as e:
+        logger.error(f"Error actualizando progreso: {str(e)}")
 
 async def download_with_aiohttp(url, filepath, progress_callback, task_id, filename, start_time):
-    """Descarga usando aiohttp (similar a main.py)"""
+    """Descarga usando aiohttp con manejo de cancelación"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
@@ -171,7 +181,7 @@ async def download_with_aiohttp(url, filepath, progress_callback, task_id, filen
                         await progress_callback(
                             downloaded, 
                             total_size,
-                            "📥 Downloading",
+                            "📥 Descargando",
                             progress_callback.progress_message,
                             filename,
                             task_id,
@@ -179,7 +189,7 @@ async def download_with_aiohttp(url, filepath, progress_callback, task_id, filen
                         )
         return True
     except Exception as e:
-        logger.error(f"aiohttp download error: {str(e)}")
+        logger.error(f"Error aiohttp: {str(e)}")
         return False
 
 async def download_with_ytdlp(url, filepath, progress_callback, task_id, filename, start_time):
@@ -195,12 +205,10 @@ async def download_with_ytdlp(url, filepath, progress_callback, task_id, filenam
             url
         ]
         
-        process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            bufsize=1
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
         )
         
         active_tasks[task_id]['process'] = process
@@ -213,10 +221,11 @@ async def download_with_ytdlp(url, filepath, progress_callback, task_id, filenam
                 process.terminate()
                 return False
                 
-            line = process.stdout.readline()
+            line = await process.stdout.readline()
             if not line:
                 break
                 
+            line = line.decode().strip()
             match = progress_pattern.search(line)
             if match:
                 percent = float(match.group(1))
@@ -224,23 +233,23 @@ async def download_with_ytdlp(url, filepath, progress_callback, task_id, filenam
                 await progress_callback(
                     int(downloaded),
                     progress_callback.total_size,
-                    "📥 Downloading",
+                    "📥 Descargando",
                     progress_callback.progress_message,
                     filename,
                     task_id,
                     start_time
                 )
         
-        process.wait()
+        await process.wait()
         return process.returncode == 0
     except Exception as e:
-        logger.error(f"yt-dlp error: {str(e)}")
+        logger.error(f"Error yt-dlp: {str(e)}")
         return False
 
 async def download_content(url, filepath, progress_callback, task_id, filename, start_time):
     """Elige el método de descarga basado en el tipo de URL"""
     if requires_ytdlp(url):
-        logger.info(f"Usando yt-dlp para URL especial: {url}")
+        logger.info(f"Usando yt-dlp para URL: {url}")
         return await download_with_ytdlp(
             url, 
             filepath,
@@ -262,20 +271,15 @@ async def download_content(url, filepath, progress_callback, task_id, filename, 
 
 def get_video_metadata(file_path):
     """Obtiene metadatos del video usando ffprobe"""
-    cmd = [
-        'ffprobe',
-        '-v', 'quiet',
-        '-print_format', 'json',
-        '-show_format',
-        '-show_streams',
-        file_path
-    ]
-    
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
         metadata = json.loads(result.stdout)
         
-        # Buscar el stream de video
         video_stream = next((stream for stream in metadata['streams'] if stream['codec_type'] == 'video'), None)
         
         if video_stream:
@@ -290,22 +294,19 @@ def get_video_metadata(file_path):
             }
         return None
     except Exception as e:
-        logger.error(f"Error al obtener metadatos: {str(e)}")
+        logger.error(f"Error obteniendo metadatos: {str(e)}")
         return None
 
 def generate_thumbnail(video_path, task_id):
     """Genera una miniatura para el video"""
     try:
         thumb_path = f"/tmp/thumb_{task_id}.jpg"
-        cmd = [
-            'ffmpeg',
-            '-i', video_path,
-            '-ss', '00:00:05',
-            '-vframes', '1',
-            '-q:v', '2',
-            thumb_path
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            ['ffmpeg', '-i', video_path, '-ss', '00:00:05', '-vframes', '1', '-q:v', '2', thumb_path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
         return thumb_path
     except Exception as e:
         logger.error(f"Error generando miniatura: {e}")
@@ -313,20 +314,21 @@ def generate_thumbnail(video_path, task_id):
 
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
-    await message.reply(
+    await safe_edit_message(
+        message,
         "🤖 **Bot de Descargas Avanzado**\n\n"
-        "Envía un enlace directo a un archivo o video de YouTube/Facebook/Instagram\n\n"
-        "También puedes agregar un nombre personalizado después del enlace:\n"
-        "`https://ejemplo.com/video.mp4 | Mi Video Personalizado.mp4`\n\n"
-        "Comandos disponibles:\n"
+        "Envía un enlace directo a un archivo o video\n\n"
+        "Puedes agregar un nombre personalizado:\n"
+        "`https://ejemplo.com/video.mp4 | Mi Video.mp4`\n\n"
+        "Comandos:\n"
         "/start - Muestra este mensaje\n"
-        "/update - Actualiza herramientas (solo propietario)\n\n"
-        "⚠️ Solo puedes tener 1 tarea activa a la vez"
+        "/update - Actualiza herramientas (propietario)\n\n"
+        "⚠️ Solo 1 tarea activa por usuario"
     )
 
 @app.on_message(filters.command("update") & filters.private)
 async def update_bot(client: Client, message: Message):
-    """Actualiza herramientas y reinicia el bot (solo owner)"""
+    """Actualiza herramientas y reinicia el bot"""
     if not is_owner(message.from_user.id):
         await message.reply("❌ Solo el propietario puede usar este comando")
         return
@@ -335,27 +337,25 @@ async def update_bot(client: Client, message: Message):
     log_file = "/tmp/update_error.log"
     
     try:
-        # Actualizar solo yt-dlp
-        update_cmd = [
-            "pip", "install", "--upgrade", 
-            "yt-dlp"
-        ]
         result = subprocess.run(
-            update_cmd,
+            ["pip", "install", "--upgrade", "yt-dlp"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True
         )
         
         if result.returncode != 0:
-            raise Exception(f"Error al actualizar: {result.stdout}")
+            raise Exception(f"Error actualizando: {result.stdout}")
         
-        # Obtener versión de yt-dlp
-        version_cmd = ["yt-dlp", "--version"]
-        version_result = subprocess.run(version_cmd, stdout=subprocess.PIPE, text=True)
+        version_result = subprocess.run(
+            ["yt-dlp", "--version"],
+            stdout=subprocess.PIPE,
+            text=True
+        )
         ytdlp_version = version_result.stdout.strip()
         
-        await msg.edit(
+        await safe_edit_message(
+            msg,
             f"✅ Herramientas actualizadas:\n"
             f"- yt-dlp: {ytdlp_version}\n\n"
             "Reiniciando bot..."
@@ -364,7 +364,6 @@ async def update_bot(client: Client, message: Message):
         os._exit(0)
         
     except Exception as e:
-        # Guardar log de error
         with open(log_file, "w") as f:
             f.write(str(e))
         
@@ -373,23 +372,21 @@ async def update_bot(client: Client, message: Message):
             document=log_file,
             caption="❌ Error al actualizar herramientas"
         )
-        await msg.edit("⚠️ Actualización fallida. Ver log para detalles.")
+        await safe_edit_message(msg, "⚠️ Actualización fallida. Ver log para detalles.")
 
-# Filtro para manejar enlaces
-@app.on_message(filters.text | filters.command)
+@app.on_message(filters.text & ~filters.command)
 async def handle_links(client: Client, message: Message):
     """Procesa enlaces de archivos/videos"""
-    if message.text.startswith('/'):
-        return
-    
     user_id = message.from_user.id
+    
+    # Verificar si el usuario tiene una tarea activa
     if user_id in user_active_tasks:
         task_id_actual = user_active_tasks[user_id]
         if task_id_actual in active_tasks:
             await message.reply(
                 "⚠️ Ya tienes una tarea en curso.\n"
-                f"ID de tarea actual: `{task_id_actual}`\n\n"
-                "Por favor espera a que finalice."
+                f"ID de tarea: `{task_id_actual}`\n\n"
+                "Espera a que finalice antes de enviar otra."
             )
             return
     
@@ -406,9 +403,7 @@ async def handle_links(client: Client, message: Message):
     user_active_tasks[user_id] = task_id
     
     # Obtener nombre de archivo
-    parsed_url = urlparse(url)
-    path = unquote(parsed_url.path)
-    original_filename = os.path.basename(path) or "file"
+    original_filename = get_filename_from_url(url)
     filename = custom_name or original_filename
     
     msg = await message.reply(f"[{task_id}] ⏬ Iniciando descarga...")
@@ -427,9 +422,8 @@ async def handle_links(client: Client, message: Message):
         async def progress_callback(current, total, status, progress_msg, name, tid, stime):
             await progress_bar(current, total, status, progress_msg, name, tid, stime)
         
-        # Adjuntar datos necesarios al callback
         progress_callback.progress_message = msg
-        progress_callback.total_size = 0  # Se actualizará después
+        progress_callback.total_size = 0
         
         # Crear ruta de descarga
         download_path = "/tmp/downloads"
@@ -447,97 +441,87 @@ async def handle_links(client: Client, message: Message):
         )
         
         if not success or not os.path.exists(file_path):
-            await msg.edit(f"[{task_id}] ❌ Error al descargar el contenido")
+            await safe_edit_message(msg, f"[{task_id}] ❌ Error al descargar el contenido")
             return
         
         file_size = os.path.getsize(file_path)
         size_mb = file_size / (1024 * 1024)
         
-        # Determinar si se necesita dividir
+        # Manejar archivos grandes
         if file_size > MAX_DIRECT_SIZE:
-            await msg.edit(f"[{task_id}] 📦 Archivo grande detectado ({size_mb:.2f} MB > 1990 MB). Dividiendo...")
-            await split_and_upload(app, message, msg, file_path, task_id)
+            await safe_edit_message(
+                msg, 
+                f"[{task_id}] 📦 Archivo grande ({size_mb:.2f} MB). Dividiendo..."
+            )
+            await split_and_upload(client, message, msg, file_path, task_id)
         else:
-            await msg.edit(f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo a Telegram...")
-            try:
-                # Detectar tipo MIME
-                mime_type, _ = mimetypes.guess_type(file_path)
-                is_video = mime_type and mime_type.startswith('video/')
+            await safe_edit_message(
+                msg, 
+                f"[{task_id}] ✅ Descarga completa ({size_mb:.2f} MB)\n⬆️ Subiendo..."
+            )
+            
+            # Detectar tipo de archivo
+            mime_type, _ = mimetypes.guess_type(file_path)
+            is_video = mime_type and mime_type.startswith('video/')
+            
+            # Función de progreso para subida
+            async def upload_callback(current, total):
+                await progress_bar(
+                    current, 
+                    total,
+                    "📤 Subiendo",
+                    msg,
+                    filename,
+                    task_id,
+                    start_time
+                )
+            
+            if is_video:
+                # Procesar video
+                metadata = get_video_metadata(file_path)
+                duration = int(metadata['duration']) if metadata else 0
+                size_mb = metadata['size'] / (1024 * 1024) if metadata else size_mb
+                resolution = metadata['resolution'] if metadata else "Desconocida"
                 
-                if is_video:
-                    # Obtener metadatos del video
-                    metadata = get_video_metadata(file_path)
-                    duration = 0
-                    thumb = None
-                    
-                    if metadata:
-                        duration = int(metadata['duration'])
-                        size_mb = metadata['size'] / (1024 * 1024)
-                        caption = (
-                            f"📹 {os.path.basename(file_path)}\n"
-                            f"💾 {size_mb:.2f} MB\n"
-                            f"🖥️ {metadata['resolution']}\n"
-                            f"⏱️ {duration} seg"
-                        )
-                        
-                        # Generar miniatura
-                        thumb = generate_thumbnail(file_path, task_id)
-                    else:
-                        caption = f"📹 {os.path.basename(file_path)}"
-                    
-                    # Función de progreso para subida
-                    async def upload_callback(current, total):
-                        await progress_bar(
-                            current, 
-                            total,
-                            "📤 Uploading",
-                            msg,
-                            filename,
-                            task_id,
-                            start_time
-                        )
-                    
-                    await app.send_video(
-                        chat_id=message.chat.id,
-                        video=file_path,
-                        caption=caption,
-                        duration=duration,
-                        thumb=thumb,
-                        progress=upload_callback
-                    )
-                    
-                    # Eliminar miniatura temporal
-                    if thumb and os.path.exists(thumb):
-                        os.remove(thumb)
-                else:
-                    async def upload_callback(current, total):
-                        await progress_bar(
-                            current, 
-                            total,
-                            "📤 Uploading",
-                            msg,
-                            filename,
-                            task_id,
-                            start_time
-                        )
-                    
-                    await app.send_document(
-                        chat_id=message.chat.id,
-                        document=file_path,
-                        progress=upload_callback
-                    )
-                await msg.edit(f"[{task_id}] ✅ Subida completada")
-            except Exception as e:
-                await msg.edit(f"[{task_id}] ❌ Error en subida: {str(e)}")
+                caption = (
+                    f"📹 {os.path.basename(file_path)}\n"
+                    f"💾 {size_mb:.2f} MB\n"
+                    f"🖥️ {resolution}\n"
+                    f"⏱️ {duration} seg"
+                )
+                
+                thumb = generate_thumbnail(file_path, task_id) if metadata else None
+                
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=file_path,
+                    caption=caption,
+                    duration=duration,
+                    thumb=thumb,
+                    progress=upload_callback
+                )
+                
+                # Limpiar miniatura
+                if thumb and os.path.exists(thumb):
+                    os.remove(thumb)
+            else:
+                # Procesar otros tipos de archivos
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=file_path,
+                    progress=upload_callback
+                )
+                
+            await safe_edit_message(msg, f"[{task_id}] ✅ Subida completada")
     except Exception as e:
-        await msg.edit(f"[{task_id}] ❌ Error en proceso: {str(e)}")
+        await safe_edit_message(msg, f"[{task_id}] ❌ Error: {str(e)}")
     finally:
         # Limpieza final
         try:
             if file_path and os.path.exists(file_path):
                 os.remove(file_path)
         except Exception as e:
-            logger.error(f"Error deleting file: {str(e)}")
+            logger.error(f"Error eliminando archivo: {str(e)}")
         
         # Limpiar registro de tareas
         if task_id in active_tasks:
@@ -551,5 +535,5 @@ async def handle_links(client: Client, message: Message):
                 del progress_last_update[key]
 
 if __name__ == "__main__":
-    logger.info("⚡ Bot iniciado con Pyrofork ⚡")
+    logger.info("⚡ Bot iniciado ⚡")
     app.run()
