@@ -289,7 +289,7 @@ async def update_bot(client: Client, message: Message):
         # Actualizar solo yt-dlp
         update_cmd = [
             "pip", "install", "--upgrade", 
-            "yt-dlp[default,curl-cffi]"
+            "yt-dlp"
         ]
         result = subprocess.run(
             update_cmd,
